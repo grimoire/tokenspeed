@@ -189,6 +189,7 @@ def _get_compiled_mla_kernel(
     is_var_seq: bool,
     is_var_split_kv: bool,
     compute_capability: tuple[int, int],
+    has_local_visible_lens: bool,
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     fold_sq_factor: int = 1,
@@ -209,7 +210,8 @@ def _get_compiled_mla_kernel(
 
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse (None to skip), workspace, split_kv_scalar, cache_seqs,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar), plus
+    local_visible_lens for the BF16 specialization when supplied.
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -394,6 +396,17 @@ def _get_compiled_mla_kernel(
         stream_fake,
         use_pdl,
     ]
+    if not is_fp8:
+        compile_args.append(
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (sym_batch, sym_seq_q),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
+            if has_local_visible_lens
+            else None
+        )
     compiled_kernel = cute.compile(
         *compile_args,
         options=(
@@ -431,6 +444,7 @@ def tokenspeed_mla_decode(
     enable_packed_q: bool = False,
     *,
     min_split_kv: int = 1,
+    local_visible_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
@@ -523,6 +537,19 @@ def tokenspeed_mla_decode(
         The effective value is capped to avoid creating empty partitions.
         Defaults to 1, which enables automatic split selection.
 
+    local_visible_lens : torch.Tensor, optional
+        BF16-only contiguous int32 [B, q_len] tensor on the query device.
+        Each value is the exclusive visible prefix length in the compact local
+        page table, overriding the inferred causal bound. Callers must provide
+        0 <= local_visible_lens[b, q] <= seq_lens[b]; values are not copied to
+        the CPU for validation. None retains the standard causal/noncausal mask.
+        Page entries must preserve logical token order. Empty local rows return
+        zero output and negative-infinity LSE (base 2), with or without split-KV.
+        Lengths may be updated in place between CUDA graph replays; max_seq_len
+        remains a positive capacity bound. Compaction and cross-rank merging
+        belong to the caller. Cannot be combined with sliding windows or
+        interleaved CP metadata.
+
     Returns
     -------
     torch.Tensor or tuple[torch.Tensor, torch.Tensor]
@@ -540,6 +567,25 @@ def tokenspeed_mla_decode(
     ), f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
+
+    if local_visible_lens is not None:
+        if query.dtype != torch.bfloat16:
+            raise ValueError("local_visible_lens currently requires BF16 Q and KV")
+        if window_left != -1 or cp_world != 1 or causal_seqs is not None:
+            raise ValueError(
+                "local_visible_lens cannot be combined with a sliding window "
+                "or interleaved context-parallel metadata"
+            )
+        if (
+            local_visible_lens.shape != (B, q_len)
+            or local_visible_lens.dtype != torch.int32
+            or local_visible_lens.device != query.device
+            or not local_visible_lens.is_contiguous()
+        ):
+            raise ValueError(
+                "local_visible_lens must be contiguous int32 [B, q_len] "
+                "on the query device"
+            )
 
     q_dtype = query.dtype
 
@@ -756,6 +802,7 @@ def tokenspeed_mla_decode(
         ),
         reducer_max_splits=reducer_max_splits,
         pack_q=pack_q,
+        has_local_visible_lens=local_visible_lens is not None,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
@@ -792,6 +839,8 @@ def tokenspeed_mla_decode(
         Float32(softmax_scale),
         Float32(output_scale),
     ]
+    if local_visible_lens is not None:
+        call_args.append(local_visible_lens)
 
     with tvm_ffi.use_torch_stream():
         compiled_kernel(*call_args)
