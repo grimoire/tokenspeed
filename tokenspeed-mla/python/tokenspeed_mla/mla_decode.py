@@ -211,7 +211,7 @@ def _get_compiled_mla_kernel(
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse (None to skip), workspace, split_kv_scalar, cache_seqs,
     block_split_kvs, softmax_scale_scalar, output_scale_scalar), plus
-    local_visible_lens for the BF16 specialization when supplied.
+    local_visible_lens when supplied.
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -396,17 +396,16 @@ def _get_compiled_mla_kernel(
         stream_fake,
         use_pdl,
     ]
-    if not is_fp8:
-        compile_args.append(
-            cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (sym_batch, sym_seq_q),
-                stride_order=(1, 0),
-                assumed_align=4,
-            )
-            if has_local_visible_lens
-            else None
+    compile_args.append(
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch, sym_seq_q),
+            stride_order=(1, 0),
+            assumed_align=4,
         )
+        if has_local_visible_lens
+        else None
+    )
     compiled_kernel = cute.compile(
         *compile_args,
         options=(
@@ -538,7 +537,8 @@ def tokenspeed_mla_decode(
         Defaults to 1, which enables automatic split selection.
 
     local_visible_lens : torch.Tensor, optional
-        BF16-only contiguous int32 [B, q_len] tensor on the query device.
+        Contiguous int32 [B, q_len] tensor on the query device, supported with
+        BF16 or FP8 E4M3 Q/KV.
         Each value is the exclusive visible prefix length in the compact local
         page table, overriding the inferred causal bound. Callers must provide
         0 <= local_visible_lens[b, q] <= seq_lens[b]; values are not copied to
@@ -569,8 +569,8 @@ def tokenspeed_mla_decode(
     assert D_qk == kv_lora_rank + qk_rope_head_dim
 
     if local_visible_lens is not None:
-        if query.dtype != torch.bfloat16:
-            raise ValueError("local_visible_lens currently requires BF16 Q and KV")
+        if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("local_visible_lens requires BF16 or FP8 E4M3 Q and KV")
         if window_left != -1 or cp_world != 1 or causal_seqs is not None:
             raise ValueError(
                 "local_visible_lens cannot be combined with a sliding window "

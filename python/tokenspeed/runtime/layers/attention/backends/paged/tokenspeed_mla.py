@@ -62,7 +62,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -101,6 +100,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     """CuteDSL MLA leaf for Blackwell SM100 GPUs.
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
+    BF16 Q/KV remain BF16 through the decode and prefill paths.
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
 
     A block drafter's proposal rides the query axis with one page table row and
@@ -155,24 +155,14 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # The backend may be constructed once per attention layer (60x for
         # Kimi-K2.5), but `warmup_compile_prefill` is idempotent: each config
         # is only JIT'd once and cached in a module-global dict.
-        # tokenspeed_mla requires --kv-cache-dtype fp8_e4m3, so tokenspeed's
-        # FP8 prefill path (deepseek_v3.py `use_fp8_prefill`) is always on and
-        # feeds fp8_e4m3fn q/k/v to the kernel — bf16 is unreachable here.
+        # The model's unit-scale FP8 path quantizes Q/K/V for prefill;
+        # BF16 cache keeps the model's BF16 Q/K/V throughout.
         d_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
         warmup_compile_prefill(
-            q_dtype=torch.float8_e4m3fn,
+            q_dtype=self.data_type,
             d_qk=d_qk,
             d_v=self.v_head_dim,
         )
-
-        # tokenspeed_mla's CuTe DSL kernel only supports fp8_e4m3 KV cache; check
-        # at startup so misconfiguration surfaces here, not in the first forward.
-        kv_cache_dtype = global_server_args_dict.get("kv_cache_dtype", "auto")
-        if kv_cache_dtype != "fp8_e4m3":
-            raise NotImplementedError(
-                f"tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
-                f"got {kv_cache_dtype!r}."
-            )
 
         self.num_local_heads = self._num_heads_per_tp
 

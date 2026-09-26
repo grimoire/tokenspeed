@@ -359,6 +359,8 @@ class TestCompile:
         [
             ("float8_e4m3fn", 16, False),
             ("float8_e4m3fn", 96, False),
+            ("float8_e4m3fn", 16, True),
+            ("float8_e4m3fn", 96, True),
             ("bfloat16", 16, False),
             ("bfloat16", 16, True),
         ],
@@ -863,7 +865,7 @@ def test_local_visible_lengths_reject_unsupported_inputs(invalid):
         )
 
 
-def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
+def _check_local_visible_gpu(batch, heads, q_len, packed, persistent, kv_len, dtype):
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
 
@@ -877,11 +879,11 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
     decode._get_compiled_mla_kernel = record_compile
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    case = _Case(batch, 385, heads, q_len)
-    q, kv, tables, lengths = _make_inputs(case, "bf16", False, "cuda")
+    case = _Case(batch, kv_len, heads, q_len)
+    q, kv, tables, lengths = _make_inputs(case, dtype, False, "cuda")
     visible = torch.empty((batch, q_len), dtype=torch.int32, device="cuda")
     workspace = torch.empty(64 * 1024**2, dtype=torch.int8, device="cuda")
-    out = torch.empty((batch, q_len, heads, 512), dtype=q.dtype, device="cuda")
+    out = torch.empty((batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda")
     kwargs = dict(
         query=q,
         kv_cache=kv,
@@ -899,7 +901,7 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
         enable_packed_q=packed,
         local_visible_lens=visible,
     )
-    boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, 385]
+    boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, kv_len]
     initial = torch.tensor(
         [
             sorted(boundaries[(b + t) % len(boundaries)] for t in range(q_len))
@@ -911,7 +913,7 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
     # Small batches must cover long visible prefixes as well as empty early rows.
     if batch == 1:
         initial[0] = torch.tensor(
-            ([129] if q_len == 1 else [0] * (q_len - 2) + [129, 257]),
+            ([129] if q_len == 1 else [0] * (q_len - 2) + [kv_len - 65, kv_len]),
             dtype=torch.int32,
             device="cuda",
         )
@@ -935,7 +937,10 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
         expected_lse = torch.full((batch, q_len, heads), -torch.inf, device="cuda")
         for b in range(batch):
             keys = (
-                kv[tables[b, : math.ceil(case.kv_len / kv.shape[1])].long()]
+                kv.view(torch.uint8)[
+                    tables[b, : math.ceil(case.kv_len / kv.shape[1])].long()
+                ]
+                .view(kv.dtype)
                 .reshape(-1, 576)
                 .float()
             )
@@ -947,16 +952,19 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
         # Poison old outputs/workspace to expose skipped writes on graph replay.
         workspace.fill_(127)
         out.fill_(torch.nan)
+        # Explicit local bounds also override the noncausal path. The captured
+        # causal variant must produce the same result for these same bounds.
+        kwargs["causal_mask"] = state != "restored"
         eager_out, eager_lse = tokenspeed_mla_decode(**kwargs)
         torch.cuda.synchronize()
-        _check_output(eager_out, expected, "bf16")
+        _check_output(eager_out, expected, dtype)
         torch.testing.assert_close(eager_lse, expected_lse, atol=2e-4, rtol=2e-4)
         workspace.fill_(127)
         out.fill_(torch.nan)
         captured_lse.fill_(torch.nan)
         graph.replay()
         torch.cuda.synchronize()
-        _check_output(captured_out, expected, "bf16")
+        _check_output(captured_out, expected, dtype)
         torch.testing.assert_close(captured_lse, expected_lse, atol=2e-4, rtol=2e-4)
         empty = visible == 0
         assert torch.count_nonzero(captured_out[empty]) == 0
@@ -964,19 +972,26 @@ def _check_local_visible_gpu(batch, heads, q_len, packed, persistent):
 
 
 class TestGPU:
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
     @pytest.mark.parametrize(
-        "batch,heads,q_len,packed,persistent",
+        "batch,heads,q_len,packed,persistent,kv_len",
         [
-            (1, 96, 1, False, False),
-            (1, 16, 4, False, False),
-            (1, 96, 3, True, True),
-            (128, 16, 4, False, False),
-            (128, 96, 3, True, True),
+            (1, 96, 1, False, False, 385),
+            (1, 16, 4, False, False, 385),
+            (1, 96, 3, True, True, 385),
+            (128, 16, 4, False, False, 385),
+            (128, 96, 3, True, True, 385),
+            (1, 16, 4, False, False, 65537),
+            (1, 96, 4, False, False, 65537),
         ],
     )
-    def test_bf16_local_visible_lengths(self, batch, heads, q_len, packed, persistent):
+    def test_local_visible_lengths(
+        self, batch, heads, q_len, packed, persistent, kv_len, dtype
+    ):
         _run_gpu_check(
-            _check_local_visible_gpu, (batch, heads, q_len, packed, persistent), 600
+            _check_local_visible_gpu,
+            (batch, heads, q_len, packed, persistent, kv_len, dtype),
+            600,
         )
 
     @pytest.mark.parametrize(
