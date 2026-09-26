@@ -1127,6 +1127,14 @@ The dense MLA implementation requires FlashMLA and its device/dtype support;
 DCP does not make unsupported kernels portable. These GPU paths currently
 exclude speculative decoding, PD transfer and KVStore.
 
+The runtime derives compact DCP page tables and local visible lengths from
+the scheduler's virtual block tables, without introducing new scheduler-owned
+request state. To support draft length changes, the read table retains
+allocated reserve pages while per-query visibility bounds limit actual reads.
+When drafting advances or reanchors to an accepted prefix, the runtime
+translates the global visibility bounds according to page ownership; a change
+in the global token count is not the same change in the local token count.
+
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
 size and each group's declared demand: a replicated full-history group holds
