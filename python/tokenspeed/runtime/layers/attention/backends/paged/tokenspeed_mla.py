@@ -56,7 +56,15 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    CompactDCPLayout,
+    CompactDCPMetadata,
+    refresh_dcp_page_table_metadata,
+)
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    resolve_cache_slots,
+)
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TOKENSPEED_MLA_DEFAULT_PAGE_SIZE,
     TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES,
@@ -94,6 +102,83 @@ class CuteDSLMLADecodeMetadata:
     # query-axis fold reads these instead of re-deriving them once per layer.
     block_page_table: torch.Tensor | None = None
     block_seq_lens: torch.Tensor | None = None
+    # Separate read view; page_table keeps the global virtual addresses.
+    dcp: CompactDCPMetadata | None = None
+
+
+class _DCPDecodeState:
+    """Own pool-bound DCP decode storage and its refresh operations.
+
+    Per-batch CompactDCPMetadata objects are views of this storage. The leaf
+    caches those views alongside its ordinary decode views and drops this
+    owner when rebinding the cache pool.
+    """
+
+    def __init__(self, placement: CachePlacement):
+        self.placement = placement
+        self.metadata: CompactDCPMetadata | None = None
+        self._visible_lens_buf: torch.Tensor | None = None
+        self._query_offsets_buf: torch.Tensor | None = None
+
+    def initialize(
+        self,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        page_size: int,
+        query_count: int,
+        causal: bool,
+    ) -> None:
+        device = page_table.device
+        self._visible_lens_buf = torch.zeros(
+            (page_table.shape[0], query_count), dtype=torch.int32, device=device
+        )
+        self._query_offsets_buf = (
+            torch.arange(1 - query_count, 1, dtype=torch.int32, device=device)
+            if causal
+            else torch.zeros(query_count, dtype=torch.int32, device=device)
+        )
+        self.metadata = refresh_dcp_page_table_metadata(
+            page_table=page_table,
+            virtual_block_count=self.placement.virtual_block_count,
+            degree=len(self.placement.group),
+            rank=self.placement.rank,
+            layout=CompactDCPLayout(
+                seq_lens,
+                page_size,
+                self.placement.block_granularity,
+                self._global_visible_lengths(seq_lens),
+            ),
+            previous=None,
+        )
+
+    def refresh(self, metadata: CompactDCPMetadata, seq_lens: torch.Tensor) -> None:
+        """Rebuild local tables and ownership prefixes at the existing addresses."""
+        refresh_dcp_page_table_metadata(
+            page_table=metadata.virtual_page_table,
+            virtual_block_count=self.placement.virtual_block_count,
+            degree=len(self.placement.group),
+            rank=self.placement.rank,
+            layout=CompactDCPLayout(
+                seq_lens,
+                metadata.page_size,
+                self.placement.block_granularity,
+                self._global_visible_lengths(seq_lens),
+            ),
+            previous=metadata,
+        )
+
+    def refresh_lengths(
+        self, metadata: CompactDCPMetadata, seq_lens: torch.Tensor
+    ) -> None:
+        """Reuse the ownership prefix when only the draft frontier changes."""
+        metadata.refresh_visible_lengths(self._global_visible_lengths(seq_lens))
+
+    def _global_visible_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        visible = self._visible_lens_buf[: seq_lens.shape[0]]
+        torch.add(seq_lens[:, None], self._query_offsets_buf, out=visible)
+        visible.clamp_min_(0)
+        return visible
 
 
 class CuteDSLMLABackend(PagedAttentionBackend):
@@ -173,6 +258,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
         self._logged_block_layouts: set[tuple[int, int, bool]] = set()
+        self.dcp_group = tuple(config.dcp_group)
+        self.dcp_rank = config.dcp_rank
+        self._dcp: _DCPDecodeState | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
@@ -181,6 +269,31 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._dcp = None
+
+    def configure_runtime(
+        self,
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+        shard_count: int,
+        **kwargs,
+    ) -> None:
+        super().configure_runtime(**kwargs)
+        if shard_count != len(self.dcp_group):
+            raise ValueError("CuTe MLA cache and DCP topology disagree")
+        self._dcp = (
+            _DCPDecodeState(
+                CachePlacement(
+                    block_granularity,
+                    virtual_block_count,
+                    self.dcp_group,
+                    self.dcp_rank,
+                )
+            )
+            if shard_count > 1
+            else None
+        )
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""
@@ -318,6 +431,36 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     # ---- CUDA Graph ----
 
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        # These rows also belong to the initialization lifecycle, not a graph
+        # capture's allocation pool. Reinitialization must replace them too.
+        self._block_page_table_buf = None
+        self._block_seq_lens_buf = None
+        if self._dcp is None:
+            return
+        if self.block_decode_active:
+            self._ensure_block_row_buffers()
+            table, lengths = self._block_page_table_buf, self._block_seq_lens_buf
+        else:
+            table, lengths = self.page_table_buf, self.seq_lens_buf
+        # Full-window draft/verify views share storage with one-query draft
+        # steps, which can use local_seq_lens as their [B, 1] bound.
+        self._dcp.initialize(
+            table,
+            lengths,
+            page_size=self.kernel_page_size,
+            query_count=self.spec_num_tokens,
+            causal=not self.block_decode_active,
+        )
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        super().advance_draft_forward_metadata(seq_lens)
+        if self._dcp is not None:
+            self._dcp.refresh_lengths(
+                self._decode_views(seq_lens.shape[0]).dcp, seq_lens
+            )
+
     def _ensure_block_row_buffers(self) -> None:
         """Resident per-request rows behind the block entries, sized once.
 
@@ -342,6 +485,15 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         The drafter calls this inside the captured graph, so the row has to be
         written there too rather than derived from the expanded view per layer.
         """
+        self._copy_block_decode_seq_lens(bs, block_seq_lens)
+        if self._dcp is not None:
+            self._dcp.refresh_lengths(
+                self._decode_views(bs).dcp, self._block_seq_lens_buf[:bs]
+            )
+
+    def _copy_block_decode_seq_lens(
+        self, bs: int, block_seq_lens: torch.Tensor
+    ) -> None:
         self._ensure_block_row_buffers()
         rows = self._block_seq_lens_buf[:bs]
         torch.clamp(
@@ -404,6 +556,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 num_extends=0,
                 q_len_per_req=self.verify_floor,
             )
+        if self._dcp is not None:
+            metadata.dcp = self._dcp.metadata.slice_requests(0, bs)
         self._decode_views_by_bs[bs] = metadata
         return metadata
 
@@ -439,7 +593,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
             replicated.copy_(rows[:, None, :])
             if not for_graph_replay or actual_bs == 0:
-                self.fill_block_decode_seq_lens(bs, seq_lens)
+                self._copy_block_decode_seq_lens(bs, seq_lens)
+            if self._dcp is not None:
+                self._dcp.refresh(metadata.dcp, metadata.block_seq_lens)
             self.forward_decode_metadata = metadata
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
@@ -450,6 +606,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # null pages in the router table.
         num_pages = min(page_table.shape[1], self.page_table_buf.shape[1])
         self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs, :num_pages])
+        if metadata.dcp is not None:
+            # Compact tables retain reserve pages, so stale columns must not
+            # become future draft destinations when a narrower table arrives.
+            self.page_table_buf[:bs, num_pages:].zero_()
+        if self._dcp is not None:
+            self._dcp.refresh(metadata.dcp, metadata.seq_lens_k)
         self.forward_decode_metadata = metadata
 
     # ---- Forward: Decode ----

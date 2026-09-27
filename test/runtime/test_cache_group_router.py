@@ -1390,6 +1390,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "chunked_prefill_metadata",
                 "_block_page_table_buf",
                 "_block_seq_lens_buf",
+                "_dcp",
             ],
         )
 
