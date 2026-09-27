@@ -29,6 +29,7 @@ Uses CuTe DSL JIT-compiled kernels for MLA decode and prefill on Blackwell SM100
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -56,6 +57,10 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     CompactDCPMetadata,
@@ -188,6 +193,10 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     BF16 Q/KV remain BF16 through the decode and prefill paths.
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
 
+    DCP decode gathers TP query heads, reads compact local KV with per-query
+    visibility, then merges partials back to the original TP heads. CuTe's
+    base-2 LSE is converted to natural logs at the shared merge boundary.
+
     A block drafter's proposal rides the query axis with one page table row and
     one cache length per request, non-causal and bounded by the layer's window.
     There is no dispatcher here, so a shape the kernel does not serve is an
@@ -230,6 +239,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
         # the decode forward with the pool frozen.
+        self.dcp_group = tuple(config.dcp_group)
+        self.dcp_rank = config.dcp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
         self.cutedsl_workspace = self._cutedsl_workspace(
@@ -258,8 +269,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
         self._logged_block_layouts: set[tuple[int, int, bool]] = set()
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
         self._dcp: _DCPDecodeState | None = None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
@@ -300,6 +309,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         required = (
             get_num_sm(self.device)
             * self._num_heads_per_tp
+            * len(self.dcp_group)
             * q_len_capacity
             * (self.kv_lora_rank + 1)
             * 4
@@ -616,6 +626,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     # ---- Forward: Decode ----
 
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        return self._dcp.placement if self._dcp is not None else None
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -662,6 +675,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 # Guards the arithmetic rather than any shipping configuration:
                 # resolve_speculative_num_tokens reconciles the two widths for
                 # every drafter this backend serves.
+                if self._dcp is not None:
+                    raise ValueError("DCP block draft requires the full query block")
                 if window_left >= 0:
                     raise ValueError(
                         f"a {q_len_per_req}-wide draft forward over a "
@@ -687,6 +702,23 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 else 1.0
             )
             softmax_scale = k_scale * layer.scaling
+
+        local_visible_lens = None
+        if metadata.dcp is not None:
+            start = 0 if self.block_decode_active else num_extends
+            local = metadata.dcp.slice_requests(start, start + bs)
+            page_table = local.local_page_table
+            cache_seqlens = local.local_seq_lens
+            # One-query draft steps consume the final endpoint of the reserved
+            # verify window; verify/block queries consume the whole window.
+            local_visible_lens = (
+                cache_seqlens[:, None]
+                if query.shape[1] == 1
+                else local.local_visible_lens
+            )
+            query = gather_query_heads(
+                query.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.dcp_group
+            ).view(bs, query.shape[1], -1, layer.head_dim)
 
         # Prepare KV cache: [num_pages, page_size, kv_cache_dim] (3D for CuteDSL)
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -715,7 +747,19 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             softmax_scale=softmax_scale,
             causal_mask=causal_mask,
             window_left=window_left,
+            local_visible_lens=local_visible_lens,
+            return_lse=metadata.dcp is not None,
         )
+        if metadata.dcp is not None:
+            partial, lse_log2 = raw_out
+            # CuTe exports base-2 LSE; the shared DCP merge uses natural logs.
+            raw_out = combine_attention_partials(
+                partial.flatten(0, 1),
+                lse_log2.flatten(0, 1) * math.log(2),
+                group=self.dcp_group,
+                rank=self.dcp_rank,
+                sink=None,
+            )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
