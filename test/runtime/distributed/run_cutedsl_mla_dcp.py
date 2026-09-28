@@ -21,7 +21,9 @@
 """CuTe MLA DCP attention against unsharded attention, using real collectives.
 
 From the repository root, run with PYTHONPATH=. and
-python -m torch.distributed.run --standalone --nproc-per-node=2 (or 4).
+python -m torch.distributed.run --standalone --nproc-per-node=4
+test/runtime/distributed/run_cutedsl_mla_dcp.py --dcp-size 2.
+Use --dcp-size 4 to cover a single DCP group across all four TP ranks.
 Covers BF16/FP8, decode/verify/draft, empty shards, eager/graph replay,
 and chunked prefill with owner-masked writes to a real cache pool.
 """
@@ -43,7 +45,8 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-def run_case(*, rank, degree, context, dtype, queries, draft, block):
+def run_case(*, rank, mapping, context, dtype, queries, draft, block):
+    degree = mapping.dcp_size
     device = torch.device("cuda", rank)
     heads, latent, dim, page, granularity = 16, 512, 576, 64, 128
     blocks = (context + granularity - 1) // granularity + 1
@@ -53,10 +56,10 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
     spec_queries = 4 if draft else queries
     spec = MLAConfig(
         backend_name="tokenspeed_mla",
-        num_attention_heads=heads * degree,
+        num_attention_heads=heads * mapping.tp_size,
         num_kv_heads=1,
         head_dim=dim,
-        attn_tp_size=degree,
+        attn_tp_size=mapping.tp_size,
         kv_lora_rank=latent,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
@@ -76,8 +79,8 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
         is_draft=draft,
         draft_block_decode=block,
         dcp_size=degree,
-        dcp_rank=rank,
-        dcp_group=tuple(range(degree)),
+        dcp_rank=mapping.dcp_rank,
+        dcp_group=mapping.dcp_group,
         components=(spec,),
     )
     # Skip unrelated prefill compilation. Decode, metadata kernels and
@@ -97,7 +100,7 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
     ).to(dtype)
     full_cache[0].zero_()
     local_cache = full_cache[
-        [0] + list(range(rank + 1, blocks + 1, degree))
+        [0] + list(range(mapping.dcp_rank + 1, blocks + 1, degree))
     ].contiguous()
     pool = SimpleNamespace(get_key_buffer=lambda layer_id: local_cache)
     layer = SimpleNamespace(
@@ -121,9 +124,18 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
     table[-1].zero_()
     ends = torch.tensor([context - 1, 8, 0], device=device, dtype=torch.int32)
     all_q = torch.randn(
-        batch, queries, heads * degree, dim, device=device, dtype=torch.bfloat16
+        batch,
+        queries,
+        heads * mapping.tp_size,
+        dim,
+        device=device,
+        dtype=torch.bfloat16,
     )
-    q = all_q[:, :, rank * heads : (rank + 1) * heads].contiguous().flatten(0, 1)
+    q = (
+        all_q[:, :, mapping.tp_rank * heads : (mapping.tp_rank + 1) * heads]
+        .contiguous()
+        .flatten(0, 1)
+    )
 
     def refresh():
         # A mixed round places extend rows before the decode slice consumed
@@ -171,7 +183,7 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
     expected = reference()
     torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.03)
     assert not actual[-1].any()
-    if rank > 0:
+    if mapping.dcp_rank > 0:
         assert (
             leaf.forward_decode_metadata.dcp.local_seq_lens[num_extends + 1].item() == 0
         )
@@ -198,16 +210,16 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
         expected = reference()
         torch.testing.assert_close(replay_output, expected, atol=0.003, rtol=0.03)
     leaf._workspace_pool.unfreeze()
-    if rank == 0:
+    if mapping.dcp_rank == 0:
         print(
-            f"PASS dtype={dtype} context={context} Q={queries} draft={draft} "
+            f"PASS group={mapping.dcp_group} dtype={dtype} context={context} Q={queries} draft={draft} "
             f"block={block}",
             flush=True,
         )
 
 
 def _make_prefill_backend(
-    *, spec, rank, degree, dtype, blocks, granularity, context_len, sharded
+    *, spec, rank, mapping, dtype, blocks, granularity, context_len, sharded
 ):
     """Build a CuTe leaf and physical cache for a sharded or reference run."""
     from dataclasses import replace
@@ -222,7 +234,7 @@ def _make_prefill_backend(
     )
 
     device = torch.device("cuda", rank)
-    shards = degree if sharded else 1
+    shards = mapping.dcp_size if sharded else 1
     plan = make_mla_memory_plan(
         size=blocks // shards * granularity,
         prefix_granularity=granularity,
@@ -260,8 +272,8 @@ def _make_prefill_backend(
         is_draft=False,
         draft_block_decode=False,
         dcp_size=shards,
-        dcp_rank=rank if sharded else 0,
-        dcp_group=tuple(range(degree)) if sharded else (rank,),
+        dcp_rank=mapping.dcp_rank if sharded else 0,
+        dcp_group=mapping.dcp_group if sharded else (rank,),
         components=(spec,),
     )
     with patch.object(tokenspeed_mla, "warmup_compile_prefill", lambda **kw: None):
@@ -275,11 +287,12 @@ def _make_prefill_backend(
     return leaf, pool
 
 
-def run_prefill_case(*, rank, degree, context, dtype):
+def run_prefill_case(*, rank, mapping, context, dtype):
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
 
     device = torch.device("cuda", rank)
+    degree = mapping.dcp_size
     granularity, heads, latent, dim = 128, 16, 512, 576
     prefix = torch.tensor([context - 3, 128, 0], dtype=torch.int32)
     extend = torch.tensor([7, 5, 3], dtype=torch.int32)
@@ -290,10 +303,10 @@ def run_prefill_case(*, rank, degree, context, dtype):
     )
     spec = MLAConfig(
         backend_name="tokenspeed_mla",
-        num_attention_heads=heads * degree,
+        num_attention_heads=heads * mapping.tp_size,
         num_kv_heads=1,
         head_dim=dim,
-        attn_tp_size=degree,
+        attn_tp_size=mapping.tp_size,
         kv_lora_rank=latent,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
@@ -305,7 +318,7 @@ def run_prefill_case(*, rank, degree, context, dtype):
     leaf, pool = _make_prefill_backend(
         spec=spec,
         rank=rank,
-        degree=degree,
+        mapping=mapping,
         dtype=dtype,
         blocks=blocks,
         granularity=granularity,
@@ -315,7 +328,7 @@ def run_prefill_case(*, rank, degree, context, dtype):
     reference_leaf, reference_pool = _make_prefill_backend(
         spec=spec,
         rank=rank,
-        degree=degree,
+        mapping=mapping,
         dtype=dtype,
         blocks=blocks,
         granularity=granularity,
@@ -422,32 +435,43 @@ def run_prefill_case(*, rank, degree, context, dtype):
     # Compare every physical row after model-side writes, including untouched
     # reserve slots and null page: foreign writes must not corrupt local KV.
     full = reference_pool.get_key_buffer(0).view(blocks + 1, granularity, 1, dim)
-    expected_cache = full[[0] + list(range(rank + 1, blocks + 1, degree))]
+    expected_cache = full[[0] + list(range(mapping.dcp_rank + 1, blocks + 1, degree))]
     torch.testing.assert_close(
         pool.get_key_buffer(0).float(),
         expected_cache.reshape(-1, 1, dim).float(),
         atol=0,
         rtol=0,
     )
-    if rank == 0:
+    if mapping.dcp_rank == 0:
         print(
-            f"PASS prefill dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
+            f"PASS prefill group={mapping.dcp_group} dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
             flush=True,
         )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dcp-size", type=int, required=True)
     parser.add_argument("--contexts", type=int, nargs="+", default=[512, 65536])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
-    degree = dist.get_world_size()
-    group = tuple(range(degree))
-    process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+    world_size = dist.get_world_size()
+    mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        attn_tp_size=world_size,
+        attn_cp_size=1,
+        attn_dp_size=1,
+        attn_dcp_size=args.dcp_size,
+    )
+    process_group_manager.register_process_group(
+        "nccl", mapping.world_group, dist.group.WORLD
+    )
+    process_group_manager.init_process_group(mapping.attn.dcp_group, backend="nccl")
     global_server_args_dict.update(
-        mapping=Mapping(rank=rank, world_size=degree),
+        mapping=mapping,
         chunked_prefill_size=64,
         max_prefill_tokens=64,
         max_model_len=max(args.contexts),
@@ -465,7 +489,7 @@ def main():
             ):
                 run_case(
                     rank=rank,
-                    degree=degree,
+                    mapping=mapping.attn,
                     context=context,
                     dtype=dtype,
                     queries=queries,
@@ -474,7 +498,9 @@ def main():
                 )
     for dtype in (torch.bfloat16, torch.float8_e4m3fn):
         for context in args.contexts:
-            run_prefill_case(rank=rank, degree=degree, context=context, dtype=dtype)
+            run_prefill_case(
+                rank=rank, mapping=mapping.attn, context=context, dtype=dtype
+            )
     dist.destroy_process_group()
 
 
