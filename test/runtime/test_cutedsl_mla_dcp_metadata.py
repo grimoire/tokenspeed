@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe leaf metadata lifecycle; DCP dispatch remains gated until collectives land."""
+"""CuTe leaf metadata lifecycle across full refresh and draft length updates."""
 
 import pytest
 import torch
@@ -37,10 +37,8 @@ def make_leaf(monkeypatch):
     monkeypatch.setattr(tokenspeed_mla, "warmup_compile_prefill", lambda **kwargs: None)
 
     def make(*, queries, draft, block, rank, degree, context=512):
-        # A hybrid parent defers leaf selection to the registry. Construct the
-        # leaf directly here: this does not enable the production DCP dispatch.
         spec = MLAConfig(
-            backend_name="hybrid_linear_attn",
+            backend_name="tokenspeed_mla",
             num_attention_heads=128,
             num_kv_heads=1,
             head_dim=576,

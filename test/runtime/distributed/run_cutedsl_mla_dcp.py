@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe MLA DCP decode against unsharded attention, using real collectives.
+"""CuTe MLA DCP attention against unsharded attention, using real collectives.
 
-Run with torchrun --standalone --nproc-per-node=2 (or 4) and this file.
-Covers BF16/FP8, decode/verify/draft, empty shards, and eager/graph replay.
+From the repository root, run with PYTHONPATH=. and
+python -m torch.distributed.run --standalone --nproc-per-node=2 (or 4).
+Covers BF16/FP8, decode/verify/draft, empty shards, eager/graph replay,
+and chunked prefill with owner-masked writes to a real cache pool.
 """
 
 import argparse
@@ -50,7 +52,7 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
     num_extends = int(queries > 1 and not draft)
     spec_queries = 4 if draft else queries
     spec = MLAConfig(
-        backend_name="hybrid_linear_attn",
+        backend_name="tokenspeed_mla",
         num_attention_heads=heads * degree,
         num_kv_heads=1,
         head_dim=dim,
@@ -78,8 +80,8 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
         dcp_group=tuple(range(degree)),
         components=(spec,),
     )
-    # Only bypass prefill compilation and the production dispatch gate. Decode,
-    # metadata kernels and communications below are the actual implementations.
+    # Skip unrelated prefill compilation. Decode, metadata kernels and
+    # communications below are the actual implementations.
     with patch.object(tokenspeed_mla, "warmup_compile_prefill", lambda **kw: None):
         leaf = tokenspeed_mla.CuteDSLMLABackend(config, spec, kernel_page_size=page)
     leaf.set_cache_pool(object())
@@ -204,6 +206,236 @@ def run_case(*, rank, degree, context, dtype, queries, draft, block):
         )
 
 
+def _make_prefill_backend(
+    *, spec, rank, degree, dtype, blocks, granularity, context_len, sharded
+):
+    """Build a CuTe leaf and physical cache for a sharded or reference run."""
+    from dataclasses import replace
+    from test.runtime.cache_pool_test_utils import (
+        make_arena,
+        make_mla_memory_plan,
+        plan_group_specs,
+    )
+
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+
+    device = torch.device("cuda", rank)
+    shards = degree if sharded else 1
+    plan = make_mla_memory_plan(
+        size=blocks // shards * granularity,
+        prefix_granularity=granularity,
+        layer_num=1,
+        latent_width=spec.kv_cache_dim,
+        dtype=dtype,
+    )
+    arena = make_arena(
+        plan,
+        device,
+        cache_group_specs=tuple(
+            replace(g, shard_count=shards) for g in plan_group_specs(plan)
+        ),
+    )
+    pool = HybridKDATokenToKVPool(
+        arena=arena,
+        layer_types=("full_attention",),
+        model_dtype=torch.bfloat16,
+        dtype=dtype,
+        quant_method=None,
+        kv_lora_rank=spec.kv_lora_rank,
+        qk_rope_head_dim=spec.qk_rope_head_dim,
+        layer_num=1,
+        rank=rank,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=dtype,
+        kv_cache_quant_method="",
+        prefix_granularity=granularity,
+        context_len=context_len,
+        max_bs=3,
+        speculative_num_draft_tokens=1,
+        is_draft=False,
+        draft_block_decode=False,
+        dcp_size=shards,
+        dcp_rank=rank if sharded else 0,
+        dcp_group=tuple(range(degree)) if sharded else (rank,),
+        components=(spec,),
+    )
+    with patch.object(tokenspeed_mla, "warmup_compile_prefill", lambda **kw: None):
+        leaf = tokenspeed_mla.CuteDSLMLABackend(config, spec, kernel_page_size=64)
+    leaf.set_cache_pool(pool)
+    leaf.configure_runtime(
+        block_granularity=granularity,
+        virtual_block_count=blocks + 1,
+        shard_count=shards,
+    )
+    return leaf, pool
+
+
+def run_prefill_case(*, rank, degree, context, dtype):
+    from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    device = torch.device("cuda", rank)
+    granularity, heads, latent, dim = 128, 16, 512, 576
+    prefix = torch.tensor([context - 3, 128, 0], dtype=torch.int32)
+    extend = torch.tensor([7, 5, 3], dtype=torch.int32)
+    per_request = (context + 7 + granularity - 1) // granularity
+    blocks = (3 * per_request + degree - 1) // degree * degree
+    global_server_args_dict.update(
+        chunked_prefill_size=min(4096, context // 2), mla_chunk_multiplier=1
+    )
+    spec = MLAConfig(
+        backend_name="tokenspeed_mla",
+        num_attention_heads=heads * degree,
+        num_kv_heads=1,
+        head_dim=dim,
+        attn_tp_size=degree,
+        kv_lora_rank=latent,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=192**-0.5,
+        kv_cache_dim=dim,
+    )
+
+    leaf, pool = _make_prefill_backend(
+        spec=spec,
+        rank=rank,
+        degree=degree,
+        dtype=dtype,
+        blocks=blocks,
+        granularity=granularity,
+        context_len=per_request * granularity,
+        sharded=True,
+    )
+    reference_leaf, reference_pool = _make_prefill_backend(
+        spec=spec,
+        rank=rank,
+        degree=degree,
+        dtype=dtype,
+        blocks=blocks,
+        granularity=granularity,
+        context_len=per_request * granularity,
+        sharded=False,
+    )
+    layer = SimpleNamespace(
+        layer_id=0, scaling=spec.scaling, logit_cap=0.0, k_scale_float=1.0
+    )
+    torch.manual_seed(312)
+    history = torch.randn(
+        blocks * granularity, 1, dim, device=device, dtype=torch.bfloat16
+    )
+    loc = torch.arange(granularity, (blocks + 1) * granularity, device=device)
+    reference_pool.get_key_buffer(0).zero_()
+    pool.get_key_buffer(0).zero_()
+    reference_pool.set_mla_kv_buffer(
+        layer, loc, history[..., :latent], history[..., latent:], write_mask=None
+    )
+    slots, mask = resolve_cache_slots(loc, leaf.cache_placement(layer))
+    pool.set_mla_kv_buffer(
+        layer, slots, history[..., :latent], history[..., latent:], write_mask=mask
+    )
+    order = (
+        torch.randperm(blocks, device=device)[: 3 * per_request].view(3, per_request)
+        + 1
+    )
+    pages = (order[..., None] * 2 + torch.arange(2, device=device)).reshape(3, -1).int()
+    positions = torch.cat(
+        [
+            torch.arange(p, p + n, device=device)
+            for p, n in zip(prefix.tolist(), extend.tolist())
+        ]
+    )
+    request_ids = torch.repeat_interleave(
+        torch.arange(3, device=device), extend.to(device).long()
+    )
+    write_locs = (
+        order[request_ids, positions // granularity] * granularity
+        + positions % granularity
+    ).long()
+    new_latent = torch.randn(
+        int(extend.sum()), dim, device=device, dtype=torch.bfloat16
+    )
+    # TP projections/queries differ by rank; latent KV is shared across DCP.
+    torch.manual_seed(713 + rank)
+    q = torch.randn(int(extend.sum()), heads * 192, device=device, dtype=torch.bfloat16)
+    weight = (
+        torch.randn(latent, heads * 256, device=device, dtype=torch.bfloat16)
+        / latent**0.5
+    )
+    model = SimpleNamespace(
+        kv_lora_rank=latent,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        qk_head_dim=192,
+        num_local_heads=heads,
+        v_head_dim=128,
+        kv_b_proj=lambda x: (x @ weight,),
+        attn_mha=layer,
+        rotary_emb=None,
+        _mla_kv_is_fp8=lambda ctx, scale: dtype == torch.float8_e4m3fn,
+    )
+    for backend in (leaf, reference_leaf):
+        backend._init_prefill_metadata(
+            (prefix + extend).to(device),
+            pages,
+            prefix.to(device),
+            prefix,
+            extend.to(device),
+            extend,
+        )
+    assert leaf.chunked_prefill_metadata.chunked_loop_num > 1
+    assert (
+        max(t.numel() for t in leaf.chunked_prefill_metadata.chunk_kv_indices_list)
+        <= global_server_args_dict["chunked_prefill_size"]
+    )
+
+    def run(backend, cache):
+        ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=cache)
+        query, key, value = DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
+            model,
+            positions,
+            q.clone(),
+            new_latent.clone(),
+            ctx,
+            write_locs,
+        )
+        output = torch.empty(
+            int(extend.sum()), heads * 128, device=device, dtype=torch.bfloat16
+        )
+        return DeepseekV3AttentionMLA.forward_normal_chunked_kv_core(
+            model,
+            query,
+            key,
+            value,
+            ctx,
+            output,
+        )
+
+    expected = run(reference_leaf, reference_pool)
+    actual = run(leaf, pool)
+    torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.03)
+    # Compare every physical row after model-side writes, including untouched
+    # reserve slots and null page: foreign writes must not corrupt local KV.
+    full = reference_pool.get_key_buffer(0).view(blocks + 1, granularity, 1, dim)
+    expected_cache = full[[0] + list(range(rank + 1, blocks + 1, degree))]
+    torch.testing.assert_close(
+        pool.get_key_buffer(0).float(),
+        expected_cache.reshape(-1, 1, dim).float(),
+        atol=0,
+        rtol=0,
+    )
+    if rank == 0:
+        print(
+            f"PASS prefill dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
+            flush=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contexts", type=int, nargs="+", default=[512, 65536])
@@ -240,6 +472,9 @@ def main():
                     draft=draft,
                     block=block,
                 )
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        for context in args.contexts:
+            run_prefill_case(rank=rank, degree=degree, context=context, dtype=dtype)
     dist.destroy_process_group()
 
 

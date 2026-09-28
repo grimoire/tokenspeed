@@ -365,6 +365,23 @@ def _apply_backend_overrides(
         # hybrid_linear_attn. The user's original choice stays in the profile
         # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
         server_args.attention_backend = "hybrid_linear_attn"
+        if (
+            draft is not None
+            and target.is_kda
+            and not target.is_dsa_kda
+            and server_args.decode_context_parallel_size > 1
+            and server_args.drafter_attention_backend in (None, "hybrid_linear_attn")
+        ):
+            # A K3 continuation must resolve its history consumer before
+            # AttnConfig validates DCP. Inherit the target's resolved leaf,
+            # while preserving an explicitly requested draft leaf.
+            server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
+                target.requested_backend,
+                is_kda=True,
+                is_dsa=False,
+                is_qsa=False,
+                has_cache_plan=True,
+            )
     elif server_args.attention_backend == "hybrid_linear_attn":
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures="
@@ -1094,9 +1111,13 @@ def create_attn_components(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
     if config.dcp_size > 1 and target.is_hybrid_linear:
-        if cache_family != "kimi_k3" or target_full_attn_backend_name != "flashmla":
+        if cache_family != "kimi_k3" or target_full_attn_backend_name not in (
+            "flashmla",
+            "tokenspeed_mla",
+        ):
             raise ValueError(
-                "Hybrid MLA DCP requires the MLA/KDA cache and FlashMLA backend"
+                "Hybrid MLA DCP requires the MLA/KDA cache and a FlashMLA "
+                "or CuTe MLA backend"
             )
         resolved_softmax = dataclasses.replace(
             softmax_attn, backend_name=target_full_attn_backend_name

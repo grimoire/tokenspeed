@@ -932,3 +932,94 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
 
     assert usable_pages == 15
     assert (usable_pages + 1) * 64 * 16 <= 16_384
+
+
+@pytest.mark.parametrize(
+    "target_backend,draft_backend,error",
+    [
+        (None, None, None),
+        ("tokenspeed_mla", None, None),
+        (None, "tokenspeed_mla", None),
+        ("trtllm_mla", None, "Hybrid MLA DCP"),
+        (None, "trtllm_mla", "DCP currently requires"),
+        (None, "flashmla", "does not yet support speculation"),
+    ],
+)
+def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+    monkeypatch, target_backend, draft_backend, error
+):
+    from test.runtime.conftest import kimi_recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+    base = kimi_recipe(tp_size=8).attn_config
+    args = SimpleNamespace(
+        attention_backend=target_backend,
+        drafter_attention_backend=draft_backend,
+        decode_context_parallel_size=2,
+        disaggregation_mode="null",
+        mapping=SimpleNamespace(world_size=8, world_group=tuple(range(8))),
+        gpu_memory_utilization=0.9,
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+    )
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGenerationNextN"])
+    )
+    built_draft = []
+
+    def create_config(server_args, model, is_draft=False):
+        name = (
+            server_args.drafter_attention_backend
+            if is_draft
+            else server_args.attention_backend
+        )
+        components = (replace(base.components[0], backend_name=name),)
+        config = replace(
+            base,
+            device="cuda",
+            dcp_size=2,
+            dcp_group=(0, 1),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=is_draft,
+            components=components if is_draft else components + base.components[1:],
+        )
+        if is_draft:
+            built_draft.append(config)
+        return config
+
+    class ReadyForAllocation(Exception):
+        pass
+
+    def profile(**kwargs):
+        config = kwargs["attn_config"]
+        assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert (
+            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        )
+        raise ReadyForAllocation
+
+    monkeypatch.setattr(
+        registry, "current_platform", lambda: SimpleNamespace(is_amd=False)
+    )
+    monkeypatch.setattr(registry, "_create_attn_config", create_config)
+    monkeypatch.setattr(registry, "profile_available_cache_memory_bytes", profile)
+    expected = (
+        pytest.raises(ValueError, match=error)
+        if error
+        else pytest.raises(ReadyForAllocation)
+    )
+    with expected:
+        registry.create_attn_components(
+            args,
+            target,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft,
+        )
+    if draft_backend is not None:
+        assert args.drafter_attention_backend == draft_backend

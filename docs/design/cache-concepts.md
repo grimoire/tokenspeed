@@ -1123,9 +1123,10 @@ Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
-The dense MLA implementation requires FlashMLA and its device/dtype support;
-DCP does not make unsupported kernels portable. These GPU paths currently
-exclude speculative decoding, PD transfer and KVStore.
+Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
+DCP does not make unsupported kernels portable. CuTe MLA supports speculative
+decoding. FlashMLA and GPU DSA still
+exclude speculative decoding; all these paths exclude PD transfer and KVStore.
 
 The runtime derives compact DCP page tables and local visible lengths from
 the scheduler's virtual block tables, without introducing new scheduler-owned
