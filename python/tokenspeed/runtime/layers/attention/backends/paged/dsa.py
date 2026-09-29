@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -111,6 +112,12 @@ class DSABackend(PagedAttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+        # rl-bitwise pins the sparse decode onto the batch-invariant no-split
+        # leaves; without one registered, selection fails at the first decode
+        # instead of silently serving an occupancy-split kernel.
+        self.kernel_solution: str | None = (
+            "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+        )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -601,6 +608,7 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
             return_lse=use_dcp,
+            solution=self.kernel_solution,
         )
         if use_dcp:
             local_output, local_lse = out
@@ -770,6 +778,7 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
             return_lse=use_dcp,
+            solution=self.kernel_solution,
         )
         if use_dcp:
             local_output, local_lse = out

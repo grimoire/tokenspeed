@@ -125,7 +125,9 @@ def _pack_kernel(
     CB: tl.constexpr,
     SS,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -243,7 +245,9 @@ def _gather_kernel(
     OS0,
     OS1,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -538,7 +542,9 @@ def _compressor_tail_scatter_kernel(
     TK,
     TD,
     LS,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * LS).to(tl.int64)
@@ -843,7 +849,9 @@ def _index_scan_kernel(
     CS0,
     CS1,
     PAGES: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
+    # The page-table width follows the batch; a compile-time value would
+    # recompile the scan for every new longest request.
+    TABLE_WIDTH,
     CANDIDATES: tl.constexpr,
     HEADS: tl.constexpr,
     SHARD_HEADS: tl.constexpr,
@@ -1285,7 +1293,9 @@ def _compressor_pool(
     NORM,
     EPS: tl.constexpr,
     HAS_NORM: tl.constexpr,
-    N: tl.constexpr,
+    # The row count is the forward's token count; a constexpr here would
+    # recompile the kernel for every new prefill length.
+    N,
     C0: tl.constexpr,
     C1: tl.constexpr,
     G0: tl.constexpr,
@@ -3046,10 +3056,12 @@ def _compressor_metadata(
     N,
     P0: tl.constexpr,
     R0: tl.constexpr,
-    TR: tl.constexpr,
-    TC: tl.constexpr,
-    TS0: tl.constexpr,
-    TS1: tl.constexpr,
+    # Table geometry grows with every prefill chunk; a constexpr here would
+    # recompile the kernel once per chunk.
+    TR,
+    TC,
+    TS0,
+    TS1,
     PAGES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

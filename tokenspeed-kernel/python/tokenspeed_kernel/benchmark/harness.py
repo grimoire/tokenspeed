@@ -182,11 +182,17 @@ def _load_builtin_generators() -> None:
     )
     from tokenspeed_kernel.benchmark.generators.gemm import (
         prepare_dense_bmm,
-        prepare_mxfp8_mm,
+        prepare_mm,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
+    )
+    from tokenspeed_kernel.benchmark.generators.mla import (
+        prepare_mla_decode,
+        prepare_mla_decode_projected_value,
+        prepare_mla_normalize_project_query,
+        prepare_mla_prefill,
     )
     from tokenspeed_kernel.benchmark.generators.moe import (
         prepare_latent_expert_shared,
@@ -215,8 +221,20 @@ def _load_builtin_generators() -> None:
         ("attention", "kpool_decode_topk"), prepare_kpool_decode_topk
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mla_normalize_project_query"),
+        prepare_mla_normalize_project_query,
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mla_decode_with_kvcache"), prepare_mla_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mla_decode_projected_value"),
+        prepare_mla_decode_projected_value,
+    )
+    _BENCHMARK_GENERATORS.setdefault(("attention", "mla_prefill"), prepare_mla_prefill)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
-    _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
+    _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
     _BENCHMARK_GENERATORS.setdefault(
         ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
     )

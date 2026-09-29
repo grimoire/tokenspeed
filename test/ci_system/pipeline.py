@@ -31,6 +31,11 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
+# Task types that start a server. They serve with the JIT compile check armed
+# as an error: a compile-time kernel parameter that keeps taking new values
+# after startup (a per-batch constexpr) fails the run instead of stalling it.
+SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
+JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
@@ -485,6 +490,18 @@ def merge_env(task_env: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
+def get_stage_command_env(stage_name: str, env: Dict[str, str]) -> Dict[str, str]:
+    """Route evaluation-tool installs to their dedicated package cache."""
+    if stage_name not in {"eval.install", "perf.install"}:
+        return env
+    evalscope_cache = env.get("EVALSCOPE_UV_CACHE_DIR")
+    if not evalscope_cache:
+        return env
+    stage_env = env.copy()
+    stage_env["UV_CACHE_DIR"] = evalscope_cache
+    return stage_env
+
+
 def get_default_runner_env(runner: str) -> Dict[str, str]:
     for prefixes, sm in RUNNER_SM_PREFIXES:
         if runner.startswith(prefixes):
@@ -827,14 +844,14 @@ def setup_runner(
             cwd=cwd,
             dry_run=dry_run,
         )
+    # Runner images normally provide ninja. Avoid refreshing every apt index on
+    # each ephemeral runner when the required executable is already available;
+    # slow package mirrors otherwise hold GPUs idle before task installation.
     shell_run(
-        "sudo apt-get -o Acquire::Retries=5 update -q",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y ninja-build",
+        "if ! command -v ninja >/dev/null 2>&1; then "
+        "sudo apt-get -o Acquire::Retries=5 update -q && "
+        "sudo apt-get install -y ninja-build; "
+        "fi",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
@@ -1798,6 +1815,12 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if task["type"] in SERVING_TASK_TYPES:
+        # Only the task itself may relax the check; a value inherited from
+        # the runner's environment must not.
+        env[JIT_COMPILE_CHECK_ENV] = str(
+            task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
+        )
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -1957,16 +1980,17 @@ def execute_task(
                     run_perf_diagnostics(
                         "before perf command", runner_env, repo_root, dry_run
                     )
+                command_env = get_stage_command_env(stage_name, runner_env)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
                         cwd=repo_root,
-                        env=runner_env,
+                        env=command_env,
                         dry_run=dry_run,
                     )
                 else:
                     command_result = shell_run(
-                        command, env=runner_env, cwd=repo_root, dry_run=dry_run
+                        command, env=command_env, cwd=repo_root, dry_run=dry_run
                     )
                 command_result["stage"] = stage_name
                 command_result.update(

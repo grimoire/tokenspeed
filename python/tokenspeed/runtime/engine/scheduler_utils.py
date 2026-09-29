@@ -22,6 +22,7 @@
 
 import math
 import os
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -38,7 +39,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.execution.types import NGramInputs
+from tokenspeed.runtime.execution.types import NGramInputs, RequestHistorySeeds
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -107,6 +108,76 @@ def ngram_inputs_for_forward(
         )
         positions.append(start)
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
+class RequestHistoryRows:
+    """Which request's committed tokens each executor history row holds.
+
+    Every forward appends its inputs to its slot's row at the committed
+    frontier, so a row holds request ``rid``'s tokens from position 0 once
+    rid has started there at position 0 or been seeded there, until another
+    request runs in the slot. That ownership decides when a forward must
+    seed its committed prefix: a prefix-cache hit, a slot handoff, a
+    retraction recovery into another slot, or a PD decode landing, whose
+    first local forward is a decode over a remotely prefilled prompt. Later
+    chunks of one prefill and ordinary decode steps never reseed.
+
+    Ownership is recorded per admission — the request's state object, held
+    weakly — not per request id: clients may reuse a finished request's id,
+    and a later request landing in the same slot must not inherit the row.
+
+    Call :meth:`seeds_for_forward` exactly once per forward the executor
+    runs, in dispatch order (the executor runs forwards in that order).
+    """
+
+    def __init__(self) -> None:
+        self._owners: dict[int, weakref.ref] = {}
+
+    def seeds_for_forward(
+        self, forward_op, rid_to_state: Mapping
+    ) -> RequestHistorySeeds | None:
+        """Record the batch's slot ownership; snapshot the prefixes it needs.
+
+        Prompt/output lists hold physical IDs. A decode's input is the
+        request's newest token, so its row must already hold every token
+        before it. Returns None when no row in the batch needs a seed.
+        """
+        slots: list[int] = []
+        prefix_lengths: list[int] = []
+        tokens: list[tuple[int, ...]] = []
+        num_extends = forward_op.num_extends()
+        for i, rid in enumerate(forward_op.request_ids):
+            slot = int(forward_op.request_pool_indices[i])
+            state = rid_to_state[rid]
+            owner = self._owners.get(slot)
+            held = owner is not None and owner() is state
+            self._owners[slot] = weakref.ref(state)
+            prompt, output = state.prompt_input_ids, state.output_ids
+            total = len(prompt) + len(output)
+            boundary = (
+                int(forward_op.extend_prefix_lens[i]) if i < num_extends else total - 1
+            )
+            if boundary <= 0 or held:
+                continue
+            if boundary > total:
+                raise ValueError(
+                    f"Request history prefix {boundary} exceeds the physical "
+                    f"tokens of {rid}"
+                )
+            if boundary <= len(prompt):
+                prefix = tuple(prompt[:boundary])
+            else:
+                prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
+            slots.append(slot)
+            prefix_lengths.append(boundary)
+            tokens.append(prefix)
+        if not slots:
+            return None
+        return RequestHistorySeeds(
+            slots=tuple(slots),
+            prefix_lengths=tuple(prefix_lengths),
+            tokens=tuple(tokens),
+        )
 
 
 @dataclass(frozen=True)

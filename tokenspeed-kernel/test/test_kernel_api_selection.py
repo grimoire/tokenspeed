@@ -140,6 +140,9 @@ from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import (
+    kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
+)
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -235,6 +238,7 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_kimi3_sigmoid_topk,
     _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
@@ -323,6 +327,8 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
         "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
+        # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
         spec.name: spec.priority
@@ -1192,6 +1198,39 @@ def _attention_mla_decode(
     )
 
 
+def _attention_mla_prefill(
+    dtype: torch.dtype, batch_size: int, q_len: int, kv_len: int, num_heads: int
+) -> object:
+    return _attention_mla_prefill_ragged(
+        dtype, q_len, (kv_len,) * batch_size, num_heads
+    )
+
+
+def _attention_mla_prefill_ragged(
+    dtype: torch.dtype, q_len: int, kv_lens: tuple[int, ...], num_heads: int
+) -> object:
+    # Selection reads the problem size from tensor shapes only, so stride-0
+    # views stand in for full-size inputs.
+    def tokens(count: int, dim: int) -> torch.Tensor:
+        return torch.empty((1, num_heads, dim), dtype=dtype).expand(count, -1, -1)
+
+    batch_size = len(kv_lens)
+    lens_kv = torch.tensor(kv_lens, dtype=torch.int32)
+    cu_seqlens_kv = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens_kv[1:] = lens_kv.cumsum(0)
+    return _attention_mla_pkg.mla_prefill(
+        q=tokens(batch_size * q_len, 192),
+        k=tokens(sum(kv_lens), 192),
+        v=tokens(sum(kv_lens), 128),
+        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32) * q_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=q_len,
+        max_seqlen_kv=max(kv_lens),
+        softmax_scale=1.0,
+        is_causal=True,
+    )
+
+
 def _attention_mla_decode_fp8_k3() -> object:
     q = torch.empty((1, 1, 12, 576), dtype=torch.bfloat16)
     kv_cache = torch.empty((2, 64, 1, 576), dtype=torch.float8_e4m3fn)
@@ -2050,6 +2089,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
     )
 
@@ -2068,6 +2108,7 @@ def _attention_dsa_decode_topk_logical() -> object:
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
@@ -2095,6 +2136,7 @@ def _attention_dsa_prefill_topk(
         row_ends,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
         page_size=page_size,
         solution=solution,
@@ -2181,6 +2223,7 @@ def _attention_dsa_decode_topk_standard(
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         q_scales=q_scales,
     )
@@ -2210,6 +2253,7 @@ def _attention_dsa_prefill_topk_standard(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
@@ -2255,6 +2299,7 @@ def test_dsa_topk_selection_receives_index_heads(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
         )
     else:
@@ -2266,6 +2311,7 @@ def test_dsa_topk_selection_receives_index_heads(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
             page_size=64,
         )
@@ -2304,6 +2350,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=1,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         page_size=64,
         candidate_lens_cpu=candidate_lens_cpu,
@@ -2396,6 +2443,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
         )
     else:
@@ -2407,6 +2455,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
             page_size=64,
         )
@@ -2431,6 +2480,7 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             page_size=64,
             **inputs,
         )
@@ -2986,6 +3036,19 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             signature,
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        forced_gluon = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 896, "topk": 16},
+            solution="gluon",
+        )
+        past_packed = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 1024, "experts": 896, "topk": 16},
+        )
         other_shape = select_kernel(
             "moe",
             "sigmoid_bias_topk",
@@ -3005,7 +3068,9 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
         registry.clear_cache()
 
     assert decode.name == "triton_decode_sigmoid_bias_topk"
-    assert batched.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
+    assert forced_gluon.name == "gluon_sigmoid_bias_topk_gfx1250"
+    assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert other_shape.name == "torch_sigmoid_bias_topk"
     assert reduced_precision.name == "torch_sigmoid_bias_topk"
 
@@ -4682,6 +4747,81 @@ _CASES = [
         "triton_mla_decode_with_kvcache",
         _attention_mla_decode_fp8q_unsupported_heads,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.bfloat16, 4, 1024, 1024, 16),
+        id_suffix="bf16",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 1024, 1024, 16),
+        id_suffix="fp8-full-gpu",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_8wave_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e5m2, 1, 128, 16384, 16),
+        id_suffix="fp8-long-keys",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mla_prefill",
+        "gluon_mla_prefill_gfx950",
+        partial(_attention_mla_prefill, torch.float8_e4m3fn, 4, 256, 256, 16),
+        id_suffix="fp8-short-keys",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            (
+                "gluon_mla_prefill_8wave_gfx950"
+                if kv_len >= 1024
+                else "gluon_mla_prefill_gfx950"
+            ),
+            partial(
+                _attention_mla_prefill, torch.float8_e4m3fn, batch, 256, kv_len, 12
+            ),
+            id_suffix=f"fp8-batch{batch}-kv{kv_len}",
+        )
+        for batch in (1, 3)
+        for kv_len in (513, 1023, 1024, 1025)
+    ],
+    # Ragged batches select on the average key length, including totals the
+    # batch size does not divide.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            expected,
+            partial(
+                _attention_mla_prefill_ragged, torch.float8_e4m3fn, 256, kv_lens, 12
+            ),
+            id_suffix=f"fp8-ragged-kv{'-'.join(map(str, kv_lens))}",
+        )
+        for kv_lens, expected in (
+            ((1023, 1024, 1024), "gluon_mla_prefill_gfx950"),
+            ((1024, 1024, 1025), "gluon_mla_prefill_8wave_gfx950"),
+            ((512, 1536, 1024), "gluon_mla_prefill_8wave_gfx950"),
+        )
+    ],
     _case(
         _is_cdna5,
         "cdna5",

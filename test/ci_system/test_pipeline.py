@@ -26,6 +26,7 @@ from pipeline import (
     get_excluded_runner_labels,
     get_jit_cache_env,
     get_runner_specific_env,
+    get_stage_command_env,
     get_stage_commands,
     is_amd_runner,
     is_cpu_only_runner,
@@ -166,6 +167,15 @@ def test_amd_gpu_runner_reclaims_stale_vram(capsys, tmp_path):
     )
 
     assert "cleanup_amd_gpu_state.sh" in capsys.readouterr().out
+
+
+def test_ci_setup_only_refreshes_apt_when_ninja_is_missing(capsys, tmp_path):
+    setup_runner("amd-mi35x-4gpu-test", {}, tmp_path, dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "if ! command -v ninja >/dev/null 2>&1; then" in output
+    assert output.count("sudo apt-get -o Acquire::Retries=5 update -q") == 1
+    assert "&& sudo apt-get install -y ninja-build; fi" in output
 
 
 @pytest.mark.parametrize(
@@ -588,6 +598,27 @@ def test_skipping_top_level_install_keeps_eval_install():
     assert [name for name, _ in stages] == ["server", "eval.install", "eval"]
 
 
+@pytest.mark.parametrize("stage_name", ["eval.install", "perf.install"])
+def test_eval_and_perf_install_use_dedicated_persistent_uv_cache(stage_name):
+    env = {
+        "UV_CACHE_DIR": "/work/.uv-cache",
+        "EVALSCOPE_UV_CACHE_DIR": "/cache/uv/evalscope",
+    }
+
+    install_env = get_stage_command_env(stage_name, env)
+
+    assert install_env is not env
+    assert install_env["UV_CACHE_DIR"] == "/cache/uv/evalscope"
+    assert get_stage_command_env("eval", env) is env
+    assert env["UV_CACHE_DIR"] == "/work/.uv-cache"
+
+
+def test_eval_install_keeps_job_uv_cache_without_persistent_cache():
+    env = {"UV_CACHE_DIR": "/work/.uv-cache"}
+
+    assert get_stage_command_env("eval.install", env) is env
+
+
 def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
     task = {
         "name": "slurm-unit-test",
@@ -681,6 +712,63 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
     assert captured["env"]["CI_RUNNER_LABEL"] == "gb300-1gpu"
     assert captured["env"]["SM"] == "sm103"
     assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
+
+
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "task_env", "expected"),
+    [
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
+    ],
+)
+def test_serving_tasks_arm_the_jit_compile_check(
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
+):
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):

@@ -44,6 +44,19 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
+def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Fold ``[world, ...]`` partial sums left to right in fp32 into ``out``.
+
+    The association order depends only on the rank axis, never on the payload
+    shape, so a row's folded value is bitwise identical at any batch size.
+    """
+    accumulator = parts[0].to(torch.float32)
+    for rank in range(1, parts.shape[0]):
+        accumulator = accumulator + parts[rank].to(torch.float32)
+    out.copy_(accumulator.to(out.dtype))
+    return out
+
+
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
@@ -67,6 +80,77 @@ class AutoBackend(CommBackend):
     @staticmethod
     def _force_deterministic_rsag() -> bool:
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+    @staticmethod
+    def _batch_invariant_collectives() -> bool:
+        return bool(global_server_args_dict.get("batch_invariant_collectives", False))
+
+    def _ordered_fold_all_reduce(
+        self, tensor: torch.Tensor, group: Group, op
+    ) -> torch.Tensor:
+        """All-gather the partials and fold them in fixed rank order.
+
+        Every element folds rank 0..n-1 left to right in fp32 with one final
+        rounding, independent of the tensor's shape -- unlike a ring
+        all-reduce, whose per-element association order follows the
+        size-dependent chunking. In-place like the NCCL all-reduce.
+        """
+        if op is not None and op != torch.distributed.ReduceOp.SUM:
+            raise ValueError("batch-invariant collectives fold SUM reductions only")
+        world_size = len(group)
+        if world_size == 1:
+            return tensor
+        gathered = self._nccl.all_gather(tensor, group, dim=0)
+        parts = gathered.view((world_size, *tensor.shape))
+        return ordered_fold_sum(parts, tensor)
+
+    def _ordered_fold_reduce_scatter(
+        self, tensor: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Exchange each rank's chunks, then fold them in fixed rank order.
+
+        ``tensor`` holds ``len(group)`` equal chunks along dim 0, chunk ``i``
+        destined for the group's ``i``-th rank. The all-to-all moves the same
+        bytes a reduce-scatter does; each rank then folds the chunks it
+        received from ranks 0..n-1 in fp32, so its output does not depend on
+        the payload size the way a ring reduce-scatter's association does.
+        """
+        world_size = len(group)
+        if world_size == 1:
+            return tensor
+        if tensor.shape[0] % world_size:
+            raise ValueError(
+                f"reduce-scatter input rows ({tensor.shape[0]}) must split evenly "
+                f"across {world_size} ranks"
+            )
+        received = torch.empty_like(tensor)
+        self._nccl.all_to_all_single(received, tensor.contiguous(), group)
+        parts = received.view(
+            (world_size, tensor.shape[0] // world_size, *tensor.shape[1:])
+        )
+        return ordered_fold_sum(parts, torch.empty_like(parts[0]))
+
+    def _ordered_fold_token_reduce_scatter(
+        self, tensor: torch.Tensor, group: Group, scattered_num_tokens: list[int]
+    ) -> torch.Tensor:
+        """Token reduce-scatter through the ordered fold (uneven token split).
+
+        Pads every rank's token slice to the largest one, as the NCCL path
+        does, so the exchange splits evenly; the padding rows are dropped.
+        """
+        max_tokens = max(scattered_num_tokens)
+        padded = tensor.new_zeros(
+            (len(scattered_num_tokens) * max_tokens, tensor.shape[-1])
+        )
+        offset = 0
+        for rank_index, count in enumerate(scattered_num_tokens):
+            padded[rank_index * max_tokens : rank_index * max_tokens + count].copy_(
+                tensor[offset : offset + count]
+            )
+            offset += count
+        folded = self._ordered_fold_reduce_scatter(padded, group)
+        rank_index = group.index(torch.distributed.get_rank())
+        return folded[: scattered_num_tokens[rank_index]].contiguous()
 
     @staticmethod
     def _group_spans_nodes(group: Group) -> bool:
@@ -119,6 +203,10 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        if self._batch_invariant_collectives():
+            return self._ordered_fold_token_reduce_scatter(
+                tensor, group, scattered_num_tokens
+            )
         if self._force_deterministic_rsag() or not self._multicast_reachable(group):
             return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
         return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
@@ -131,6 +219,12 @@ class AutoBackend(CommBackend):
         group: Group,
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if self._batch_invariant_collectives():
+            if isinstance(tensor, torch.Tensor):
+                return self._ordered_fold_all_reduce(tensor, group, op)
+            return tuple(
+                self._ordered_fold_all_reduce(value, group, op) for value in tensor
+            )
         if not isinstance(tensor, torch.Tensor):
             tensors = tensor
             if len(tensors) == 0:
@@ -283,6 +377,8 @@ class AutoBackend(CommBackend):
         return self._nccl.all_gather_single(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
+        if self._batch_invariant_collectives():
+            return self._ordered_fold_reduce_scatter(tensor, group)
         return self._nccl.reduce_scatter(tensor, group)
 
     def all_to_all_single(

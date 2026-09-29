@@ -19,7 +19,13 @@ best people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests and update docs for the changed code.
+* Add tests for the changed code. Don't be excessive--avoid checking trivial
+  details or exceptions.
+* Update docs for the changed code. Use concise comments to explain code
+  where it might be tricky for humans to understand, and leave project/component
+  level (design) docs focusing on high-level picture. In general, put suitable
+  docs at the suitable place and avoid duplicating the same across a lot of
+  places.
 * For code comments, use common/existing terms for easy human understanding;
   avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
@@ -95,6 +101,11 @@ change.
 * Keep PR titles, descriptions, commit messages, diffs, comments, logs, and
   artifacts limited to public information. Never include private repository
   names or links, private dates, or any other private or internal information.
+* When opening a pull request, if you have write access to this repository,
+  push the head branch to this repository rather than to a fork. Only
+  same-repository branches receive repository secrets such as `HF_TOKEN`
+  (higher Hugging Face rate limits), get the automated Claude code review, and
+  run CI jobs that skip fork pull requests.
 
 ## Dependency boundaries
 
@@ -167,6 +178,25 @@ Inside the root `tokenspeed-kernel/` directory:
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
 * Use tight atol/rtol in correctness comparison tests.
+* Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`,
+  `cutlass.Constexpr`) are part of the JIT cache key: a new value triggers a
+  recompilation on the forward thread and stalls serving for 100+ ms. Use it
+  for fixed static values once the server starts (e.g., model dimensions,
+  feature flags) or scalar knob specialization that matters greatly for kernel
+  performance (e.g., block size, alignment). Values that vary per batch or
+  request (e.g, token, request, row counts, sequence lengths, block-table
+  widths), and values derived from them (e.g., the strides that follow those
+  widths, split counts computed from the batch size), must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. The same holds for template arguments of other
+  JITs such as DeepGEMM. Reviews should check every new or changed kernel
+  signature and launch site for this. Kernels should have tests to guard
+  against excessive scalar parameter specialization with
+  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
+  need to test. At runtime `tokenspeed_kernel.compile_monitor` logs every
+  Triton compilation after startup and names a parameter that keeps taking
+  new values; CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
+  parameter fails the model tests.
 
 ## tokenspeed-kernel-amd
 
@@ -176,6 +206,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
+* The compile-time parameter rule in the `tokenspeed-kernel` section applies
+  to these kernels too.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the

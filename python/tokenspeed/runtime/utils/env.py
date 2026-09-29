@@ -41,6 +41,8 @@ global_server_args_dict: dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "mapping": ServerArgs.mapping,
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
+    "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
+    "numerics": ServerArgs.numerics,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
@@ -89,6 +91,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_nan_detection": server_args.enable_nan_detection,
             "mapping": server_args.mapping,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
+            "batch_invariant_collectives": server_args.batch_invariant_collectives,
+            "numerics": server_args.numerics,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
@@ -255,6 +259,13 @@ class Envs:
     # raises. Any such synchronization on the data plane stalls the forward
     # thread until the in-flight step drains and defeats overlap scheduling.
     TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
+    # Triton compilations once serving starts: "warn" logs each one with what
+    # changed and names a compile-time kernel parameter that keeps taking new
+    # values (a per-batch constexpr, one JIT compile on the forward thread per
+    # batch shape), "error" raises on such a parameter, "off" disables the
+    # monitor. CI serves with "error".
+    TOKENSPEED_STARTUP_TIMING = EnvBool(False)
+    TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
@@ -335,6 +346,8 @@ class Envs:
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
     TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
+    # Eager V4.1 vision input tokens, before spatial merging.
+    TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS = EnvInt(16384)
     TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on

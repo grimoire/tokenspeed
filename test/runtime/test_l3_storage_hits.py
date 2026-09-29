@@ -814,6 +814,7 @@ def test_l3_recovery_preserves_round_order(
         _gather_grammar_state=Mock(return_value=None),
         output_processor=SimpleNamespace(rid_to_state={}),
         _ngram_context_len=0,
+        _request_history_rows=None,
         _dispatch_depends_on_pending_commit=Mock(return_value=False),
         _mark_stats_scheduled=Mock(),
         _batch_logger=SimpleNamespace(log_dispatch=Mock()),

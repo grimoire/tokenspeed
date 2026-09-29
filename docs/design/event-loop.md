@@ -155,6 +155,19 @@ Python location, `error` raises there. CI runs the serving paths with
 `error`; the control plane's event wait and non-blocking copies are not
 flagged, so a report is always a real stall.
 
+A JIT compilation on the forward thread is the same kind of stall, only
+longer: the round waits 100 ms to seconds while a kernel compiles for a new
+compile-cache key. Startup compiles on purpose (graph capture, tuning), so
+`run_event_loop` installs `tokenspeed_kernel.compile_monitor` before building
+anything and marks the end of startup right after arming the sync-debug
+mode; the encode loop marks it after its ready message. From then on every
+Triton compilation is logged with its duration and cause, exported as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`
+from the per-round metrics call, and a compile-time kernel parameter that
+keeps taking new values from one call site -- a per-batch value passed as
+`tl.constexpr` -- is reported by name. `TOKENSPEED_JIT_COMPILE_CHECK=error`
+raises there instead, and CI serving jobs run with it.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -249,11 +262,13 @@ behind the forward that captured it, not inline.
 
 ## Principle 5: publishing drains, once per round
 
-`_publish_scheduler_kv_events` has drain semantics: KV events accumulate
-inside the C++ scheduler across any number of mutations (advance,
+`_publish_scheduler_kv_events` has drain semantics: cache mutations
+accumulate inside the C++ scheduler across any number of calls (advance,
 `next_execution_plan`), so a single unconditional call at the loop tail
-publishes everything the round produced, in order, as one batch. Do not add
-per-mutation publish calls; they only fragment batches.
+publishes everything the round produced, in order, as one batch. The batch
+is the round's net change: a block evicted and cached again within the round
+produces no event. Do not add per-mutation publish calls; they only fragment
+batches.
 
 The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the
@@ -327,6 +342,10 @@ before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.
 
+An empty memory-resume request is a successful no-op while a drain is
+pending. It must preserve that drain's admission hold until the owning
+pause or memory-release operation finishes.
+
 ## Anatomy of a round
 
 For orientation, one iteration of `event_loop`:
@@ -376,6 +395,8 @@ For orientation, one iteration of `event_loop`:
 * Never issue CUDA work, or hold something that can, from the control plane.
 * Never synchronize with the device from the data plane's per-round path;
   run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
+* Never let a kernel's compile key follow the batch shape; run with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error` while developing on the serving path.
 * L3 `batch_exists` registration is on the admit path, but only when
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must
