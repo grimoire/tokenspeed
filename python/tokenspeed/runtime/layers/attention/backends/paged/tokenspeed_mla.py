@@ -182,6 +182,8 @@ class _DCPDecodeState:
     def _global_visible_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
         visible = self._visible_lens_buf[: seq_lens.shape[0]]
         torch.add(seq_lens[:, None], self._query_offsets_buf, out=visible)
+        # Initialization starts with zero lengths; causal offsets can be negative.
+        # Prefix-table lookups require nonnegative endpoints even for dummy rows.
         visible.clamp_min_(0)
         return visible
 

@@ -89,6 +89,7 @@ def combine_attention_partials(
     output = reduce_scatter(weighted, group).movedim(0, 1)
     if sink is None:
         # Request token-major storage during the cast to avoid copying twice.
+        # Keep contiguous() for FP32, where to() can return the original view.
         return output.to(
             dtype=local_output.dtype, memory_format=torch.contiguous_format
         ).contiguous()

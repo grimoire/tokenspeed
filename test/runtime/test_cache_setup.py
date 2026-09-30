@@ -1089,5 +1089,33 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
         assert args.drafter_attention_backend == draft_backend
 
 
+@pytest.mark.parametrize("degree", [1, 2])
+def test_kimi_dspark_rejects_sharded_context_writes(degree):
+    from tokenspeed.runtime.layers.attention import registry
+
+    def side(architecture):
+        return registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture]),
+                model_profile=None,
+            ),
+            "tokenspeed_mla",
+        )
+
+    args = SimpleNamespace(
+        attention_backend="tokenspeed_mla",
+        drafter_attention_backend="tokenspeed_mla",
+        decode_context_parallel_size=degree,
+    )
+    target = side("KimiK3ForConditionalGeneration")
+    draft = side("K3DSparkModel")
+    if degree > 1:
+        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
+            registry._apply_backend_overrides(args, target, draft)
+    else:
+        registry._apply_backend_overrides(args, target, draft)
+        assert args.drafter_attention_backend == "tokenspeed_mla"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

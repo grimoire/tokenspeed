@@ -277,17 +277,17 @@ def compact_dcp_pages(
             local_lengths[row] = tokens
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["PSTRIDE", "VSTRIDE", "OSTRIDE", "COLS", "QUERIES"])
 def _local_visible_lengths(
     Prefix,
     Visible,
     Out,
     LocalLens,
-    PSTRIDE: tl.constexpr,
-    VSTRIDE: tl.constexpr,
-    OSTRIDE: tl.constexpr,
-    COLS: tl.constexpr,
-    QUERIES: tl.constexpr,
+    PSTRIDE,
+    VSTRIDE,
+    OSTRIDE,
+    COLS,
+    QUERIES,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

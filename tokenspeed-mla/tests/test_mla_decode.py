@@ -881,6 +881,8 @@ def _check_local_visible_gpu(
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
 
+    decode._FP16_PARTIALS = partial_fp16
+
     original_compile = decode._get_compiled_mla_kernel
     selections = []
 
