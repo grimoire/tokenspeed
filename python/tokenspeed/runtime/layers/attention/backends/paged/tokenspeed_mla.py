@@ -207,6 +207,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     # Decode forwards layer.sliding_window_size as window_left; prefill takes
     # no window, and a draft model only ever runs decode.
     supports_layer_sliding_window: bool = True
+    supports_mla_dcp: bool = True
 
     _logged_decode = False
     _logged_prefill = False

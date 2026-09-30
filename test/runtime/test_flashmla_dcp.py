@@ -29,6 +29,30 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_query_gather_preserves_bytes(monkeypatch, dtype):
+    from tokenspeed.runtime.layers.attention.dcp import comm
+
+    query = torch.arange(256, dtype=torch.uint8).view(dtype).reshape(2, 8, 16)
+    query = query.transpose(1, 2)
+
+    def gather(payload, group, dim):
+        assert payload.dtype == torch.uint8 and payload.is_contiguous()
+        assert group == (0, 1) and dim == -1
+        return torch.cat((payload, payload), dim=dim)
+
+    monkeypatch.setattr(comm, "all_gather", gather)
+    result = comm.gather_query_heads(query, (0, 1))
+    assert result.dtype == dtype
+    torch.testing.assert_close(
+        result.view(torch.uint8),
+        torch.cat((query.view(torch.uint8), query.view(torch.uint8)), dim=1),
+        rtol=0,
+        atol=0,
+    )
+    assert comm.gather_query_heads(query, (0,)) is query
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_noncontiguous_pages_and_partial_tail(degree, device):
@@ -608,12 +632,13 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         family="mla",
         server_args=SimpleNamespace(max_total_tokens=token_limit),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=24_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -651,12 +676,13 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         family="dsa",
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1_048_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
