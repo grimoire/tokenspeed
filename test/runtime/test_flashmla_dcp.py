@@ -292,10 +292,11 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch", [1, 3])
-def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dtype):
     from tokenspeed.runtime.layers.attention.dcp import comm
 
-    output = torch.randn(batch, 8, 512, dtype=torch.bfloat16, device="cuda")
+    output = torch.randn(batch, 8, 512, dtype=dtype, device="cuda")
     lse = torch.zeros(batch, 8, dtype=torch.float32, device="cuda")
     # Identical shards let the expected head-owner slice be computed exactly.
     monkeypatch.setattr(
