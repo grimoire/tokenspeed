@@ -481,7 +481,6 @@ def _check_packed_gpu():
 
     torch.backends.cuda.matmul.allow_tf32 = False
     workspace = torch.zeros(32 * 1024**2, dtype=torch.int8, device="cuda")
-    decode._FP16_PARTIALS = partial_fp16
     original_compile = decode._get_compiled_mla_kernel
     selections = []
 

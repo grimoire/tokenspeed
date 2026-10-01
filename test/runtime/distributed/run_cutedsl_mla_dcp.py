@@ -151,9 +151,9 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
         )
 
     def forward():
-        return leaf.forward_decode(
-            q, None, None, layer, None, pool, batch, save_kv_cache=False
-        ).view(batch, queries, heads, latent)
+        return leaf.forward_decode(q, None, None, layer, None, pool, batch).view(
+            batch, queries, heads, latent
+        )
 
     def reference():
         offsets = (
@@ -289,6 +289,7 @@ def _make_prefill_backend(
 
 def run_prefill_case(*, rank, mapping, context, dtype):
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
 
     device = torch.device("cuda", rank)
@@ -335,8 +336,15 @@ def run_prefill_case(*, rank, mapping, context, dtype):
         context_len=per_request * granularity,
         sharded=False,
     )
-    layer = SimpleNamespace(
-        layer_id=0, scaling=spec.scaling, logit_cap=0.0, k_scale_float=1.0
+    layer = PagedAttention(
+        num_heads=heads,
+        head_dim=192,
+        scaling=spec.scaling,
+        num_kv_heads=heads,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
     )
     torch.manual_seed(312)
     history = torch.randn(
@@ -389,8 +397,6 @@ def run_prefill_case(*, rank, mapping, context, dtype):
         v_head_dim=128,
         kv_b_proj=lambda x: (x @ weight,),
         attn_mha=layer,
-        rotary_emb=None,
-        _mla_kv_is_fp8=lambda ctx, scale: dtype == torch.float8_e4m3fn,
     )
     for backend in (leaf, reference_leaf):
         backend._init_prefill_metadata(
@@ -409,7 +415,7 @@ def run_prefill_case(*, rank, mapping, context, dtype):
 
     def run(backend, cache):
         ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=cache)
-        query, key, value = DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
+        prepared = DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
             positions,
             q.clone(),
@@ -422,9 +428,9 @@ def run_prefill_case(*, rank, mapping, context, dtype):
         )
         return DeepseekV3AttentionMLA.forward_normal_chunked_kv_core(
             model,
-            query,
-            key,
-            value,
+            prepared.query,
+            prepared.key,
+            prepared.value,
             ctx,
             output,
         )

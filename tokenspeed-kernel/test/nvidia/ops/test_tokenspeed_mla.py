@@ -216,7 +216,7 @@ def test_pdl_off_matches_pdl_on(
 
 def test_sm103_bf16_decode_causal_variants_compile() -> None:
     """The SM103 BF16 decode path compiles for both mask variants."""
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[4]
     mla_python = repo_root / "tokenspeed-mla" / "python"
     script = textwrap.dedent("""
         import torch
