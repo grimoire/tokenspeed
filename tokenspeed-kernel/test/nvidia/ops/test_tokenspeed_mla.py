@@ -243,6 +243,7 @@ def test_sm103_bf16_decode_causal_variants_compile() -> None:
                 cp_world=1,
                 use_pdl=False,
                 return_lse=False,
+                has_local_visible_lens=False,
                 compute_capability=(10, 3),
                 partial_fp16=False,
             )

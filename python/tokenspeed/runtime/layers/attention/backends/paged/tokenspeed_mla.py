@@ -66,10 +66,7 @@ from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
-from tokenspeed.runtime.layers.attention.dcp.placement import (
-    CachePlacement,
-    resolve_cache_slots,
-)
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TOKENSPEED_MLA_DEFAULT_PAGE_SIZE,
     TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES,
@@ -641,23 +638,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
-        if save_kv_cache:
-            assert k is not None
-            local_slots, write_mask = resolve_cache_slots(
-                out_cache_loc, self.cache_placement(layer)
-            )
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                local_slots,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-                write_mask=write_mask,
-            )
-
+        # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
@@ -699,12 +682,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         softmax_scale = layer.scaling
         if self.data_type == torch.float8_e4m3fn:
             query = query.to(self.data_type)
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-            softmax_scale = k_scale * layer.scaling
 
         local_visible_lens = None
         if metadata.dcp is not None:
@@ -777,7 +754,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError(

@@ -1064,6 +1064,18 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
     monkeypatch.setattr(
         registry, "current_platform", lambda: SimpleNamespace(is_amd=False)
     )
+
+    # This test resolves NVIDIA backend capabilities without constructing them.
+    # Their modules are not registered on AMD hosts.
+    class DCPBackend(AttentionBackend):
+        supports_mla_dcp = True
+
+    for name in ("tokenspeed_mla", "flashmla"):
+        monkeypatch.setitem(
+            registry._BACKEND_REGISTRY,
+            name,
+            ({registry.AttentionArch.MLA}, DCPBackend),
+        )
     monkeypatch.setattr(registry, "_create_attn_config", create_config)
     monkeypatch.setattr(registry, "profile_available_cache_memory_bytes", profile)
     expected = (

@@ -59,7 +59,6 @@ def _fake_layer(layer_id: int, scaling: float = _LATENT_DIM**-0.5):
         head_dim=_LATENT_DIM,
         v_head_dim=_KV_LORA_RANK,
         scaling=scaling,
-        k_scale_float=None,
         logit_cap=0.0,
     )
 
@@ -113,6 +112,7 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
         ],
         max_bs=max(bs, 4),
         max_tokens_per_req=backend.spec_num_tokens,
+        max_extend_tokens=0,
         device=device,
     )
     raw = torch.tensor(logical_rows, dtype=torch.int32, device=device)
@@ -390,9 +390,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     q = torch.randn(
         bs * q_len, _HEADS, _LATENT_DIM, device="cuda", dtype=torch.bfloat16
     )
-    out_grouped = grouped_backend.forward_decode(
-        q, None, None, layer, None, pool, bs, save_kv_cache=False
-    )
+    out_grouped = grouped_backend.forward_decode(q, None, None, layer, None, pool, bs)
 
     # Single-table arm: byte-equivalent hand-built kernel-page table.
     single_table_backend = backend_factory(q_len=q_len)
@@ -410,7 +408,7 @@ def test_decode_grouped_matches_single_table_and_reference(
         single_table_md.page_table[:, :width],
     )
     out_single_table = single_table_backend.forward_decode(
-        q, None, None, layer, None, pool, bs, save_kv_cache=False
+        q, None, None, layer, None, pool, bs
     )
     torch.cuda.synchronize()
     assert torch.equal(out_grouped, out_single_table)
