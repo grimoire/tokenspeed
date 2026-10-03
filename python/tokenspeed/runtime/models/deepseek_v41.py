@@ -214,6 +214,33 @@ def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | N
     )
 
 
+class _V41Fp8Config(Mxfp8Config):
+    """Select the reference dense method before Linear creates its parameters."""
+
+    def get_quant_method(
+        self, layer: nn.Module, prefix: str
+    ) -> _ReferenceFp8LinearMethod:
+        return _ReferenceFp8LinearMethod(self)
+
+
+def _v41_linear_config(quant_config: QuantizationConfig | None) -> _V41Fp8Config | None:
+    """Bind V4.1 Linear semantics without changing the routed-expert config."""
+    if quant_config is None:
+        return None
+    if not isinstance(quant_config, Mxfp8Config) or quant_config.weight_block_size != [
+        1,
+        32,
+    ]:
+        raise ValueError("Configure V4.1 linears with the lossless 1x32 MXFP8 config")
+    return _V41Fp8Config(
+        is_checkpoint_fp8_serialized=quant_config.is_checkpoint_fp8_serialized,
+        activation_scheme=quant_config.activation_scheme,
+        ignored_layers=quant_config.ignored_layers,
+        weight_block_size=quant_config.weight_block_size,
+        scale_fmt=quant_config.scale_fmt,
+    )
+
+
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
@@ -223,6 +250,27 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # the power-of-two scales in once -- both exact in BF16 -- and run the
         # BF16 GEMM. Costs the FP8 weight size again.
         self.load_as_bf16 = current_platform().is_hopper
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        _configure_v41_weight_loaders(layer, self.load_as_bf16, True)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
@@ -280,7 +328,20 @@ def configure_v41_fp8_linear(layer: LinearBase, expand_checkpoint_scales: bool) 
     ) or layer.quant_config.weight_block_size != [1, 32]:
         raise ValueError("Configure V4.1 linears with the lossless 1x32 MXFP8 config")
     layer.quant_method = _ReferenceFp8LinearMethod(layer.quant_config)
-    if layer.quant_method.load_as_bf16:
+    _configure_v41_weight_loaders(
+        layer, layer.quant_method.load_as_bf16, expand_checkpoint_scales
+    )
+
+
+def _configure_v41_weight_loaders(
+    layer: LinearBase, load_as_bf16: bool, expand_checkpoint_scales: bool
+) -> None:
+    """Adapt storage and checkpoint scales before handing shards to Linear.
+
+    The construction-time method and the remaining shared-expert/Engram adapter
+    use the same conversion until those consumers migrate to the config hook.
+    """
+    if load_as_bf16:
         # Same shape and sharding loader as the FP8 parameter; the loader's
         # copy widens each E4M3 code to BF16 exactly.
         codes = layer.weight
@@ -320,10 +381,9 @@ def _replicated(input_size, output_size, dtype, quant_config, prefix):
         bias=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=quant_config,
+        quant_config=_v41_linear_config(quant_config),
         prefix=prefix,
     )
-    configure_v41_fp8_linear(layer, True)
     return layer
 
 
@@ -335,7 +395,7 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
         gather_output=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=quant_config,
+        quant_config=_v41_linear_config(quant_config),
         output_sizes=None,
         prefix=prefix,
         tp_rank=mapping.attn.tp_rank,
@@ -345,7 +405,6 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
         override_kernel_name=None,
         interleave_linear_and_gate=False,
     )
-    configure_v41_fp8_linear(layer, True)
     return layer
 
 
@@ -374,7 +433,7 @@ def _merged(input_size, output_sizes, dtype, quant_config, prefix):
         gather_output=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=quant_config,
+        quant_config=_v41_linear_config(quant_config),
         prefix=prefix,
         tp_rank=0,
         tp_size=1,
@@ -383,7 +442,6 @@ def _merged(input_size, output_sizes, dtype, quant_config, prefix):
         override_kernel_name=None,
         interleave_linear_and_gate=False,
     )
-    configure_v41_fp8_linear(layer, True)
     return layer
 
 
@@ -763,7 +821,7 @@ class DeepseekV41Attention(nn.Module):
             skip_bias_add=False,
             params_dtype=torch.bfloat16,
             reduce_results=False,
-            quant_config=quant_config,
+            quant_config=_v41_linear_config(quant_config),
             prefix=add_prefix("wo_b", prefix),
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
@@ -772,7 +830,6 @@ class DeepseekV41Attention(nn.Module):
             override_kernel_name=None,
             interleave_linear_and_gate=False,
         )
-        configure_v41_fp8_linear(self.wo_b, True)
         self.compressor = (
             DeepseekV41Compressor(config, layer_id, add_prefix("compressor", prefix))
             if self.is_kv_source
