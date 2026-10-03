@@ -222,7 +222,7 @@ class LinearBase(torch.nn.Module):
                 if should_exclude_quant_module(prefix, quant_config.ignored_layers):
                     self.quant_method = UnquantizedLinearMethod()
                 else:
-                    self.quant_method = Fp8LinearMethod(quant_config)
+                    self.quant_method = quant_config.get_quant_method(self, prefix)
             if isinstance(quant_config, W8A8Fp8Config):
                 self.quant_method = W8A8Fp8LinearMethod(quant_config)
 
