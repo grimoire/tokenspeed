@@ -77,7 +77,6 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41RotaryEmbedding,
-    configure_v41_fp8_linear,
     v41_hc_post,
     v41_hc_pre,
     v41_mxfp8_config,
@@ -432,23 +431,31 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
-        merged = MergedColumnParallelLinear(
-            input_size=128,
-            output_sizes=[128, 128],
-            bias=False,
-            gather_output=False,
-            skip_bias_add=False,
-            params_dtype=torch.bfloat16,
-            quant_config=quant,
-            prefix="shared.gate_up_proj",
-            tp_rank=rank,
-            tp_size=4,
-            tp_group=mapping.attn.tp_group,
-            use_presharded_weights=False,
-            override_kernel_name=None,
-            interleave_linear_and_gate=False,
+        # Shared experts consume the config through the unchanged V4 MLP.
+        shared = v41.DeepseekV4MLP(
+            128,
+            128,
+            "silu",
+            mapping,
+            quant,
+            "shared",
+            swiglu_limit=None,
+            reduce_results=False,
+            is_shared_expert=False,
         )
-        configure_v41_fp8_linear(merged, True)
+        merged = shared.gate_up_proj
+        assert isinstance(merged.quant_method, v41._ReferenceFp8LinearMethod)
+        assert isinstance(shared.down_proj.quant_method, v41._ReferenceFp8LinearMethod)
+        scales = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+        shared.down_proj.weight_scale_inv.weight_loader(
+            shared.down_proj.weight_scale_inv, scales
+        )
+        torch.testing.assert_close(
+            shared.down_proj.weight_scale_inv,
+            scales.repeat_interleave(32, dim=0).chunk(4, dim=1)[rank],
+            rtol=0,
+            atol=0,
+        )
         for shard in (0, 1):
             scales = (torch.arange(16).reshape(4, 4) + 100 + shard).to(torch.uint8)
             merged.weight_scale_inv.weight_loader(
@@ -500,7 +507,7 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
             "column": v41.ColumnParallelLinear,
             "row": v41.RowParallelLinear,
         }[kind]
-    layer = cls(quant_config=v41._v41_linear_config(quant), **kwargs)
+    layer = cls(quant_config=quant, **kwargs)
     assert isinstance(layer.quant_method, v41._ReferenceFp8LinearMethod)
     assert layer.weight.dtype == (torch.bfloat16 if hopper else torch.float8_e4m3fn)
     expected_weights, expected_scales = [], []

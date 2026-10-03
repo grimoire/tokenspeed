@@ -193,7 +193,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | None:
-    """Return a lossless per-row scale configuration from checkpoint 32x32 FP8."""
+    """Select V4.1 dense loading/execution with lossless 1x32 runtime scales."""
     if quant_config is None:
         return None
     if (
@@ -205,7 +205,7 @@ def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | N
         raise ValueError(
             "V4.1 dense weights require checkpoint FP8 with 32x32 E8M0 scales"
         )
-    return Mxfp8Config(
+    return _V41Fp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         ignored_layers=quant_config.ignored_layers,
@@ -221,24 +221,6 @@ class _V41Fp8Config(Mxfp8Config):
         self, layer: nn.Module, prefix: str
     ) -> _ReferenceFp8LinearMethod:
         return _ReferenceFp8LinearMethod(self)
-
-
-def _v41_linear_config(quant_config: QuantizationConfig | None) -> _V41Fp8Config | None:
-    """Bind V4.1 Linear semantics without changing the routed-expert config."""
-    if quant_config is None:
-        return None
-    if not isinstance(quant_config, Mxfp8Config) or quant_config.weight_block_size != [
-        1,
-        32,
-    ]:
-        raise ValueError("Configure V4.1 linears with the lossless 1x32 MXFP8 config")
-    return _V41Fp8Config(
-        is_checkpoint_fp8_serialized=quant_config.is_checkpoint_fp8_serialized,
-        activation_scheme=quant_config.activation_scheme,
-        ignored_layers=quant_config.ignored_layers,
-        weight_block_size=quant_config.weight_block_size,
-        scale_fmt=quant_config.scale_fmt,
-    )
 
 
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
@@ -270,7 +252,43 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             params_dtype,
             **extra_weight_attrs,
         )
-        _configure_v41_weight_loaders(layer, self.load_as_bf16, True)
+        if self.load_as_bf16:
+            # Same shape and sharding loader as the FP8 parameter; the loader's
+            # copy widens each E4M3 code to BF16 exactly.
+            codes = layer.weight
+            layer.weight = ModelWeightParameter(
+                data=torch.empty_like(codes.data, dtype=torch.bfloat16),
+                input_dim=codes.input_dim,
+                output_dim=codes.output_dim,
+                weight_loader=codes.weight_loader,
+            )
+            layer.weight.loads_fp8_codes = True
+        scale = layer.weight_scale_inv
+        original_loader = scale.weight_loader
+
+        def load_scale(
+            param: nn.Parameter, loaded_weight: torch.Tensor, *shard_ids
+        ) -> None:
+            if (
+                loaded_weight.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+                or loaded_weight.ndim != 2
+            ):
+                raise TypeError(
+                    "V4.1 projection scales must be a 2D E8M0 checkpoint tensor"
+                )
+            if isinstance(layer, ReplicatedLinear):
+                if loaded_weight.shape != ((param.shape[0] + 31) // 32, param.shape[1]):
+                    raise ValueError(
+                        "V4.1 projection scales must use checkpoint 32x32 blocks"
+                    )
+            expanded = loaded_weight.view(torch.uint8).repeat_interleave(32, dim=0)
+            if isinstance(layer, ReplicatedLinear):
+                # Engram can have a partial final output block.
+                expanded = expanded[: param.shape[0]]
+            original_loader(param, expanded, *shard_ids)
+
+        scale._weight_loader = load_scale
+        scale.v41_checkpoint_block_size = (32, 32)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
@@ -314,66 +332,6 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         return self.apply(layer, activation(x), bias)
 
 
-def configure_v41_fp8_linear(layer: LinearBase, expand_checkpoint_scales: bool) -> None:
-    """Bind exact activation quantization and an optional checkpoint scale loader.
-
-    Scale expansion precedes the existing TP/merged loader, which still owns
-    sharding. Pass False for Engram, whose loader already expands scale rows.
-    This helper never changes FP8 weight values or routed-expert parameters.
-    """
-    if layer.weight.dtype != torch.float8_e4m3fn:
-        return
-    if not isinstance(
-        layer.quant_config, Mxfp8Config
-    ) or layer.quant_config.weight_block_size != [1, 32]:
-        raise ValueError("Configure V4.1 linears with the lossless 1x32 MXFP8 config")
-    layer.quant_method = _ReferenceFp8LinearMethod(layer.quant_config)
-    _configure_v41_weight_loaders(
-        layer, layer.quant_method.load_as_bf16, expand_checkpoint_scales
-    )
-
-
-def _configure_v41_weight_loaders(
-    layer: LinearBase, load_as_bf16: bool, expand_checkpoint_scales: bool
-) -> None:
-    """Adapt storage and checkpoint scales before handing shards to Linear.
-
-    The construction-time method and the remaining shared-expert/Engram adapter
-    use the same conversion until those consumers migrate to the config hook.
-    """
-    if load_as_bf16:
-        # Same shape and sharding loader as the FP8 parameter; the loader's
-        # copy widens each E4M3 code to BF16 exactly.
-        codes = layer.weight
-        layer.weight = ModelWeightParameter(
-            data=torch.empty_like(codes.data, dtype=torch.bfloat16),
-            input_dim=codes.input_dim,
-            output_dim=codes.output_dim,
-            weight_loader=codes.weight_loader,
-        )
-        layer.weight.loads_fp8_codes = True
-    if not expand_checkpoint_scales:
-        return
-    scale = layer.weight_scale_inv
-    original_loader = scale.weight_loader
-
-    def load_scale(
-        param: nn.Parameter, loaded_weight: torch.Tensor, *shard_ids
-    ) -> None:
-        if (
-            loaded_weight.dtype not in (torch.uint8, torch.float8_e8m0fnu)
-            or loaded_weight.ndim != 2
-        ):
-            raise TypeError(
-                "V4.1 projection scales must be a 2D E8M0 checkpoint tensor"
-            )
-        expanded = loaded_weight.view(torch.uint8).repeat_interleave(32, dim=0)
-        original_loader(param, expanded, *shard_ids)
-
-    scale._weight_loader = load_scale
-    scale.v41_checkpoint_block_size = (32, 32)
-
-
 def _replicated(input_size, output_size, dtype, quant_config, prefix):
     layer = ReplicatedLinear(
         input_size=input_size,
@@ -381,7 +339,7 @@ def _replicated(input_size, output_size, dtype, quant_config, prefix):
         bias=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=_v41_linear_config(quant_config),
+        quant_config=quant_config,
         prefix=prefix,
     )
     return layer
@@ -395,7 +353,7 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
         gather_output=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=_v41_linear_config(quant_config),
+        quant_config=quant_config,
         output_sizes=None,
         prefix=prefix,
         tp_rank=mapping.attn.tp_rank,
@@ -433,7 +391,7 @@ def _merged(input_size, output_sizes, dtype, quant_config, prefix):
         gather_output=False,
         skip_bias_add=False,
         params_dtype=dtype,
-        quant_config=_v41_linear_config(quant_config),
+        quant_config=quant_config,
         prefix=prefix,
         tp_rank=0,
         tp_size=1,
@@ -821,7 +779,7 @@ class DeepseekV41Attention(nn.Module):
             skip_bias_add=False,
             params_dtype=torch.bfloat16,
             reduce_results=False,
-            quant_config=_v41_linear_config(quant_config),
+            quant_config=quant_config,
             prefix=add_prefix("wo_b", prefix),
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
@@ -1107,10 +1065,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             add_prefix("ffn", prefix),
             aux_stream=aux_stream,
         )
-        if self.ffn.shared_experts is not None:
-            for module in self.ffn.shared_experts.modules():
-                if isinstance(module, LinearBase):
-                    configure_v41_fp8_linear(module, True)
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
@@ -1126,7 +1080,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 config,
                 layer_id,
                 mapping,
-                quant_config,
+                dense_quant,
                 add_prefix("engram", prefix),
                 self.attn.wq_a_wkv.weight.device,
                 host_table,
@@ -1135,8 +1089,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             if layer_id in config.engram_layer_ids
             else None
         )
-        if self.engram is not None:
-            configure_v41_fp8_linear(self.engram.wkv, False)
         mix_hc = (2 + config.hc_mult) * config.hc_mult
         for name in ("attn", "ffn"):
             for suffix, shape in (
