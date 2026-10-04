@@ -288,7 +288,6 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             original_loader(param, expanded, *shard_ids)
 
         scale._weight_loader = load_scale
-        scale.v41_checkpoint_block_size = (32, 32)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
