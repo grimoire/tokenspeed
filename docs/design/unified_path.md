@@ -738,10 +738,10 @@ model alone is not a reason to introduce a bespoke backend.
 the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
 when this view owns GDN layers. Forward dispatch and PD step recording stay
 with that child; the root broadcasts cache and metadata lifecycle calls.
-Registry construction selects the attention child first, then composes the
-Qwen4-Exp consumers once, regardless of whether this view has GDN layers.
-The factory reads the pool view to choose these consumers and leaves binding
-to the common validation and publication path after construction.
+Registry construction selects the attention child; the Qwen4-Exp composite
+selects its consumers from the pool view's local fields, regardless of whether
+this view has GDN layers. Binding stays with the common validation and
+publication path after construction.
 The root initializes the common `AttentionBackend` attributes from its own
 `AttnConfig`, including draft status, verify width, dtype and head geometry;
 these attributes do not depend on an attention child's wrapper shape.

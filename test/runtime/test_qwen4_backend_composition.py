@@ -47,10 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
-from tokenspeed.runtime.layers.attention.registry import (
-    _compose_qwen4_exp_backend,
-    _prepare_fixed_workspaces,
-)
+from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 
 def _config(*, is_draft: bool, width: int):
@@ -110,7 +107,7 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
     attention = (
         HybridLinearAttnBackend(full, SimpleNamespace(), [3]) if hybrid else full
     )
-    backend = _compose_qwen4_exp_backend(config, pool, attention)
+    backend = Qwen4ExpBackend.from_cache_view(config, pool, attention)
     assert backend.attention_backend is attention
     assert (backend.ple_backend is not None) == has_ple
     assert (backend.indexer_backend is not None) == has_qsa
@@ -123,6 +120,35 @@ def test_composition_uses_local_fields_without_requiring_linear_layers(
     assert backend.num_kv_heads == 1
     assert backend.head_dim == 16
     assert backend.cache_pool is None
+    if backend.ple_backend is not None:
+        assert backend.ple_backend.cache_pool is None
+    if backend.indexer_backend is not None:
+        assert backend.indexer_backend.full_attn_backend is full
+        assert backend.indexer_backend.cache_pool is None
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize(
+    "missing_group", [QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP]
+)
+def test_composition_rejects_incomplete_local_qsa_groups(is_draft, missing_group):
+    fields = [
+        SimpleNamespace(field_id=f"layer.3.{group}", group_id=group)
+        for group in (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+        if group != missing_group
+    ]
+    # Another view's field must not complete this view's QSA group pair.
+    fields.append(
+        SimpleNamespace(field_id=f"layer.9.{missing_group}", group_id=missing_group)
+    )
+    pool = SimpleNamespace(
+        field_layer_range=range(3, 4),
+        arena=SimpleNamespace(plan=SimpleNamespace(fields=fields)),
+    )
+    with pytest.raises(ValueError, match="both compressed and recent cache groups"):
+        Qwen4ExpBackend.from_cache_view(
+            _config(is_draft=is_draft, width=4), pool, SimpleNamespace()
+        )
 
 
 @pytest.mark.parametrize(

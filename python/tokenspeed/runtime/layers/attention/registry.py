@@ -972,59 +972,12 @@ def _create_hybrid_linear_attn_backend(
             f"{'LCM state fields'!s}",
         )
     if is_qwen4_exp(hf_config):
-        backend = _compose_qwen4_exp_backend(config, pool, backend)
-    return backend
-
-
-def _compose_qwen4_exp_backend(config, pool, attention_backend) -> AttentionBackend:
-    """Attach each Qwen4 consumer only when this pool view publishes its fields."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-        HybridLinearAttnBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
-        QSAIndexerBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-        Qwen4ExpBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
-        Qwen4ExpPLEBackend,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
-        QWEN4_EXP_PLE_CACHE_GROUP,
-        QWEN4_EXP_QSA_CACHE_GROUP,
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-        cache_field_layer_id,
-    )
-
-    local_groups = {
-        field.group_id
-        for field in pool.arena.plan.fields
-        if cache_field_layer_id(field.field_id) in pool.field_layer_range
-    }
-    ple = (
-        Qwen4ExpPLEBackend(config, config.component(SoftmaxAttnConfig))
-        if QWEN4_EXP_PLE_CACHE_GROUP in local_groups
-        else None
-    )
-    qsa_groups = {QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP}
-    if local_groups & qsa_groups and not qsa_groups <= local_groups:
-        raise ValueError(
-            "QSA consumer requires both compressed and recent cache groups"
+        from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+            Qwen4ExpBackend,
         )
-    full_attn_backend = (
-        attention_backend.full_attn_backend
-        if isinstance(attention_backend, HybridLinearAttnBackend)
-        else attention_backend
-    )
-    indexer = (
-        QSAIndexerBackend(config, full_attn_backend)
-        if qsa_groups <= local_groups
-        else None
-    )
-    return Qwen4ExpBackend(config, attention_backend, ple, indexer)
+
+        backend = Qwen4ExpBackend.from_cache_view(config, pool, backend)
+    return backend
 
 
 def _wrap_inkling_backend(
