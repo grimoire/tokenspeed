@@ -25,7 +25,6 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import (
@@ -980,56 +979,6 @@ def _create_hybrid_linear_attn_backend(
     return backend
 
 
-def _wrap_inkling_backend(
-    inner,
-    text_config,
-    attn_config,
-    *,
-    num_layers,
-    is_draft,
-    enable_layerwise_cache_ready=False,
-):
-    """Wrap a dense backend with the engine-side Inkling sconv state pool.
-
-    The wrapper only adds conv metadata; all attention delegates to ``inner``.
-    """
-    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-        InklingAttnBackend,
-        InklingConvStatePool,
-    )
-
-    kernel_size = text_config.sconv_kernel_size
-    spec_tokens = attn_config.speculative_num_draft_tokens
-    # Ring row of absolute position p is p % R. R must keep a round's
-    # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
-    # taps + K chunk rows. Uniform across target and draft.
-    ring_size = (kernel_size - 1) + spec_tokens
-    conv_pool = InklingConvStatePool(
-        num_layers=num_layers,
-        # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
-        num_slots=attn_config.max_bs + 2,
-        conv_dim=inkling_conv_total_dim(
-            text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
-        ),
-        ring_size=ring_size,
-        dtype=torch.bfloat16,
-        device=attn_config.device,
-    )
-    logger.info(
-        f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
-        f"layers x {attn_config.max_bs + 2:d} slots, "
-        f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
-    )
-    backend = InklingAttnBackend(
-        inner,
-        conv_pool,
-        spec_num_tokens=spec_tokens,
-        enable_layerwise_cache_ready=enable_layerwise_cache_ready,
-    )
-    return backend
-
-
 def _create_target_components(
     *,
     server_args,
@@ -1074,8 +1023,12 @@ def _create_target_components(
     if not is_inkling:
         return backend, pool
 
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+
     text_config = model_config.hf_config.get_text_config()
-    backend = _wrap_inkling_backend(
+    backend = InklingAttnBackend.from_config(
         backend,
         text_config,
         config,
@@ -1144,16 +1097,21 @@ def _create_draft_components(
 
     backend = _create_attn_backend(model_config.attention_arch, config)
     if is_inkling:
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
         # Depth layers carry conv checkpoint fields as continuation tenants
         # of the target's kvconv/hiddenconv groups; the draft gets the same
         # paged bridges (publish/restore) the target wrapper gets.
         text_config = model_config.hf_config.get_text_config()
-        backend = _wrap_inkling_backend(
+        backend = InklingAttnBackend.from_config(
             backend,
             text_config,
             config,
             num_layers=num_layers,
             is_draft=True,
+            enable_layerwise_cache_ready=False,
         )
     return backend, draft_pool
 

@@ -128,6 +128,59 @@ def _mha_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
+@pytest.mark.parametrize(
+    "is_draft,width,num_layers,layerwise,ring_rows",
+    [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
+)
+def test_inkling_construction_matches_ring_reservation(
+    is_draft, width, num_layers, layerwise, ring_rows
+):
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+        _conv_ring_bytes,
+    )
+
+    config = _mha_config()
+    spec = replace(
+        config.component(MHAConfig),
+        num_attention_heads=4,
+        num_kv_heads=4,
+        attn_tp_size=2,
+    )
+    config = replace(
+        config,
+        components=(spec,),
+        is_draft=is_draft,
+        speculative_num_draft_tokens=width,
+    )
+    text = SimpleNamespace(
+        sconv_kernel_size=4,
+        num_key_value_heads=4,
+        head_dim=2,
+        hidden_size=8,
+    )
+    inner = AttentionBackend(config, spec)
+    backend = InklingAttnBackend.from_config(
+        inner,
+        text,
+        config,
+        num_layers=num_layers,
+        is_draft=is_draft,
+        enable_layerwise_cache_ready=layerwise,
+    )
+    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_spec_num_tokens == width
+    assert backend.enable_layerwise_cache_ready is layerwise
+    assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
+        text_config=text,
+        attn_config=config,
+        num_layers=num_layers,
+        spec_tokens=width,
+    )
+
+
 def _mla_config() -> AttnConfig:
     spec = MLAConfig(
         backend_name="trtllm_mla",
