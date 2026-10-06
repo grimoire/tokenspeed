@@ -783,38 +783,6 @@ def _create_attn_backend_with_name(
     return cls(config, spec)
 
 
-def _resolve_kda_backend(kda_backend: str) -> str:
-    """Resolve the KDA prefill backend policy.
-
-    On AMD, the backend policy is ignored and compatible kernels are selected
-    using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
-    device-specific implementation is available, ``flashkda`` on SM90+, and
-    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
-    support. Decode is unaffected.
-    """
-    platform = current_platform()
-    if platform.is_amd:
-        # Named backend policies are NVIDIA-specific; let the registry decide.
-        return "auto"
-
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
-
-    if kda_backend == "auto":
-        if cutedsl_kda_supported():
-            resolved = "cutedsl_kda"
-        elif platform.is_hopper_plus:
-            resolved = "flashkda"
-        else:
-            resolved = "fla"
-        logger.info(f"KDA prefill backend auto-resolved to {resolved!s}")
-        return resolved
-    if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
-        raise ValueError(
-            "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
-        )
-    return kda_backend
-
-
 def _resolve_hybrid_full_backend_name(
     requested_name: str | None,
     *,
@@ -846,13 +814,14 @@ def _kda_linear_attn_backend(
 ) -> AttentionBackend:
     from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
+        resolve_kda_backend,
     )
 
     return KdaAttnBackend(
         config,
         config.component(SoftmaxAttnConfig),
         enable_prefill_graph=not server_args.disable_kda_prefill_graph,
-        kda_backend=_resolve_kda_backend(server_args.kda_backend.strip().lower()),
+        kda_backend=resolve_kda_backend(server_args.kda_backend.strip().lower()),
     )
 
 
