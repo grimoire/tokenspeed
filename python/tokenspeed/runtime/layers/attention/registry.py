@@ -1234,8 +1234,6 @@ def create_attn_components(
 
     config = _create_attn_config(server_args, model_config)
     softmax_attn = config.component(SoftmaxAttnConfig)
-    if target.is_deepseek_v4:
-        softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     cache_family = _resolve_cache_family(target, config)
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
@@ -1273,10 +1271,6 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    if draft is not None and draft.is_deepseek_v4:
-        draft_softmax_attn.sliding_window_tokens = int(
-            draft_model_config.hf_config.sliding_window
-        )
     draft_full_attn_backend_name = (
         # The draft's hybrid sub-backend request is its config's own
         # resolution, not the user's target choice.
