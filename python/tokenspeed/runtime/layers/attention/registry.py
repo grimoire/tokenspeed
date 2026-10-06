@@ -471,7 +471,6 @@ def _apply_backend_overrides(
                 is_kda=True,
                 is_dsa=False,
                 is_qsa=False,
-                has_cache_plan=True,
             )
     elif server_args.attention_backend == HYBRID_LINEAR_ATTN_BACKEND:
         logger.warning(
@@ -504,7 +503,6 @@ def _resolve_full_attn_backend_name(
             is_kda=profile.is_kda,
             is_dsa=profile.is_dsa_kda,
             is_qsa=profile.is_qsa,
-            has_cache_plan=True,
         )
     return softmax_attn.backend_name
 
@@ -789,22 +787,21 @@ def _resolve_hybrid_full_backend_name(
     is_kda: bool,
     is_dsa: bool,
     is_qsa: bool,
-    has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
     name = None if requested_name == HYBRID_LINEAR_ATTN_BACKEND else requested_name
-    if has_cache_plan and is_qsa:
+    if is_qsa:
         if name is not None:
             logger.warning(
                 "Qwen4-Exp QSA pins its sparse dispatch to the qsa backend; "
                 f"ignoring explicit attention backend {requested_name!r}",
             )
         return "qsa"
-    if has_cache_plan and is_dsa and name is None:
+    if is_dsa and name is None:
         return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
-    if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
+    if is_kda and name is None and not current_platform().is_amd:
         return "tokenspeed_mla"
     return name
 
