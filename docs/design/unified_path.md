@@ -830,9 +830,12 @@ of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
-before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`
-selects its GDN/PLE/QSA consumers, allocates each once and returns their total
-bytes; registry only invokes this operation and checks the recipe budget.
+before sizing the arena. `preallocate_verify_workspace` is called on the
+backend root and returns its verify buffers' bytes. The hybrid delegates to
+its recurrent child; Qwen4-Exp invokes its attention child, PLE and QSA.
+Registry retains the recipe's preparation conditions and budget check,
+without opening the recurrent child. Inkling ring accounting and QCP
+history-gather allocation and sharing remain separate from verify preparation.
 Draft roots allocate no target verify workspace. Qwen4-Exp reserves no
 verify workspace when the target width is one, even with a draft model
 attached; this includes the inherited GDN/PLE staging budget and PLE commit

@@ -150,14 +150,13 @@ class Qwen4ExpBackend(AttentionBackend):
         """Preallocate target verify consumers and return their total byte count."""
         if self.is_draft or self.spec_num_tokens <= 1:
             return 0
-        gdn = (
-            self.attention_backend.linear_attn_backend
-            if isinstance(self.attention_backend, HybridLinearAttnBackend)
-            else None
-        )
         return sum(
             consumer.preallocate_verify_workspace(max_bs, draft_token_num)
-            for consumer in (gdn, self.ple_backend, self.indexer_backend)
+            for consumer in (
+                self.attention_backend,
+                self.ple_backend,
+                self.indexer_backend,
+            )
             if consumer is not None
         )
 

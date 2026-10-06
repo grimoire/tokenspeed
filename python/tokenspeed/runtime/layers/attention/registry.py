@@ -1184,13 +1184,10 @@ def _prepare_fixed_workspaces(
     width = int(server_args.speculative_num_draft_tokens or 1)
     allocated = False
     actual_bytes = 0
-    if isinstance(backend, Qwen4ExpBackend):
+    if isinstance(backend, Qwen4ExpBackend) or (
+        uses_paged_state_verify and expected_bytes
+    ):
         actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
-        allocated = True
-    elif uses_paged_state_verify and expected_bytes:
-        actual_bytes += backend.linear_attn_backend.preallocate_verify_workspace(
-            config.max_bs, width
-        )
         allocated = True
     elif is_inkling:
         actual_bytes += backend.fixed_workspace_bytes()

@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -70,6 +71,32 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
         num_layers=num_layers,
         rank=rank,
     )
+
+
+@pytest.mark.parametrize(
+    "uses_paged_state_verify,expected_bytes",
+    [(True, 128), (True, 0), (False, 128)],
+)
+def test_verify_preparation_calls_root_with_existing_budget_gate(
+    uses_paged_state_verify, expected_bytes
+):
+    backend = Mock(spec=AttentionBackend)
+    backend.preallocate_verify_workspace.return_value = 128
+    draft_backend = Mock(spec=AttentionBackend)
+    kwargs = dict(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=3),
+        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        backend=backend,
+        draft_backend=draft_backend,
+        uses_paged_state_verify=uses_paged_state_verify,
+        is_inkling=False,
+    )
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
+    if uses_paged_state_verify and expected_bytes:
+        backend.preallocate_verify_workspace.assert_called_once_with(4, 3)
+    else:
+        backend.preallocate_verify_workspace.assert_not_called()
+    draft_backend.preallocate_verify_workspace.assert_not_called()
 
 
 def _model_wide_kwargs(**overrides) -> dict:

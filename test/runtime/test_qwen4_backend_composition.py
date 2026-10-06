@@ -32,6 +32,7 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.registry as registry
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
@@ -178,11 +179,11 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
 
         return SimpleNamespace(preallocate_verify_workspace=preallocate)
 
-    attention = SimpleNamespace(device="cpu")
-    if has_gdn:
-        attention = HybridLinearAttnBackend(attention, consumer("gdn", 3), [0])
     config = _config(is_draft=is_draft, width=width)
     config.max_bs = 2
+    attention = AttentionBackend(config, config.component(SoftmaxAttnConfig))
+    if has_gdn:
+        attention = HybridLinearAttnBackend(attention, consumer("gdn", 3), [0])
     root = Qwen4ExpBackend(
         config,
         attention,
