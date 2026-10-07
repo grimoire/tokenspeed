@@ -73,6 +73,65 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 3])
+def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
+    from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=int(width > 1),
+    )
+    config = replace(recipe.attn_config, device="cuda", max_bs=2)
+    recipe.attn_config = config
+    if recipe.draft_attn_config is not None:
+        recipe.draft_attn_config = replace(
+            recipe.draft_attn_config, device="cuda", max_bs=2
+        )
+    recipe.probe_batch_rows = 4
+    recipe.server_args.disable_kda_prefill_graph = True
+    recipe.server_args.kda_backend = "auto"
+    linear = config.component(LinearAttnConfig)
+    num_layers = recipe.model_config.num_attention_layers
+    model = SimpleNamespace(
+        num_attention_layers=num_layers,
+        attention_arch=registry.AttentionArch.DSA,
+        hf_config=SimpleNamespace(
+            architectures=["Glm53FlashForConditionalGeneration"],
+            full_attention_layer_ids=[
+                layer for layer in range(num_layers) if layer not in linear.layer_ids
+            ],
+        ),
+    )
+    setup = recipe.setup()
+    arena = create_cache_arena(
+        setup.spec, device=config.device, enable_memory_saver=False
+    )
+    backend, pool = registry._create_target_components(
+        server_args=recipe.server_args,
+        model_config=model,
+        config=config,
+        cache_spec=setup.spec.layer_view(first_layer=0, num_layers=num_layers),
+        arena=arena,
+        rank=0,
+        full_attn_backend_name="dsa",
+        linear_attention="kda",
+        is_inkling=False,
+        backend=None,
+    )
+    backend.set_cache_pool(pool)
+    # The tail allocation is shared by target/draft views; count its storage
+    # once, together with the verify buffers owned by the target backend.
+    tail_bytes = pool._kpool_tail_workspace.storage.nbytes
+    verify_bytes = (
+        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
+    )
+    assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
+
+
 @pytest.mark.parametrize(
     "uses_paged_state_verify,expected_bytes",
     [(True, 128), (True, 0), (False, 128)],
